@@ -150,8 +150,11 @@ try:
 
     # Add resource (supports URL, file, or directory)
     # Local directory scans respect .gitignore by default.
+    # Wait until semantic processing completes before inspecting the resource.
+    print("Wait for semantic processing...")
     add_result = client.add_resource(
-        path="https://raw.githubusercontent.com/volcengine/OpenViking/refs/heads/main/README.md"
+        path="https://raw.githubusercontent.com/volcengine/OpenViking/refs/heads/main/README.md",
+        wait=True,
     )
     root_uri = add_result['root_uri']
 
@@ -164,10 +167,6 @@ try:
     if glob_result['matches']:
         content = client.read(glob_result['matches'][0])
         print(f"Content preview: {content[:200]}...\n")
-
-    # Wait for semantic processing to complete
-    print("Wait for semantic processing...")
-    client.wait_processed()
 
     # Get abstract and overview of the resource
     abstract = client.abstract(root_uri)
@@ -196,12 +195,13 @@ python example.py
 ### Expected Output
 
 ```
+Wait for semantic processing...
+
 Directory structure:
 ...
 
 Content preview: ...
 
-Wait for semantic processing...
 Abstract:
 ...
 
