@@ -106,6 +106,9 @@ impl GitService {
             let abs = format!("/local/{}/{}", account, rel_path);
             match self.vfs.stat(&abs).await {
                 Ok(info) if info.is_dir => continue, // ignore directories
+                // TODO: dir↔file type transitions (path used to be a file,
+                // is now a directory or vice-versa) are not handled — the
+                // stale entry of the opposite kind lingers in the tree.
                 Ok(_) => {
                     let bytes = self.vfs.read(&abs, 0, 0).await?;
                     let oid = crate::git::util::write_object(
