@@ -30,6 +30,7 @@ pub mod backends;
 pub mod error;
 pub mod object_store;
 pub mod ref_store;
+pub mod tree_builder;
 pub mod util;
 
 pub use error::{GitError, ObjectStoreError, RefStoreError};
