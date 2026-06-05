@@ -76,8 +76,12 @@ pub enum GitError {
     InvalidAccountId(String),
 
     /// Concurrent commit conflict
-    #[error("concurrent commit conflict, please retry")]
-    ConcurrentCommit,
+    #[error("concurrent commit: ref {ref_name} changed during commit (expected {expected:?}, actual {actual:?})")]
+    ConcurrentCommit {
+        ref_name: String,
+        expected: Option<gix_hash::ObjectId>,
+        actual:   Option<gix_hash::ObjectId>,
+    },
 
     /// Blob too large
     #[error("blob too large: {size} bytes exceeds limit {limit} bytes")]
@@ -98,4 +102,14 @@ pub enum GitError {
     /// Other error
     #[error("{0}")]
     Other(String),
+
+    /// Vfs error wrapper
+    #[error("vfs: {0}")]
+    Vfs(String),
+}
+
+impl From<crate::core::errors::Error> for GitError {
+    fn from(e: crate::core::errors::Error) -> Self {
+        GitError::Vfs(e.to_string())
+    }
 }
