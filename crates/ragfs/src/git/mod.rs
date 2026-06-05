@@ -27,6 +27,7 @@
 //! ```
 
 pub mod backends;
+pub mod commit;
 pub mod error;
 pub mod object_store;
 pub mod ref_store;
