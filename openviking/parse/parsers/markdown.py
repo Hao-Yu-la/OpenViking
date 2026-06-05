@@ -169,6 +169,7 @@ class MarkdownParser(BaseParser):
         source_path: Optional[str] = None,
         instruction: str = "",
         base_dir: Optional[Path] = None,
+        allowed_media_dirs: Optional[List[Path]] = None,
         **kwargs,
     ) -> ParseResult:
         """
@@ -184,6 +185,10 @@ class MarkdownParser(BaseParser):
             source_path: Optional source file path
             instruction: Processing instruction (unused in v5.0)
             base_dir: Base directory for relative paths
+            allowed_media_dirs: Additional directories from which derived media
+                (e.g. images extracted by the PDF/DOC parser) may be read. The
+                caller is responsible for ensuring these belong to the current
+                input resource's lifecycle.
             **kwargs: Additional runtime options
 
         Returns:
@@ -254,7 +259,7 @@ class MarkdownParser(BaseParser):
 
             # Ingest local image files, placing each image next to the
             # markdown file that references it.
-            await self._ingest_local_images(root_dir, base_dir)
+            await self._ingest_local_images(root_dir, base_dir, allowed_media_dirs)
 
             parse_time = time.time() - start_time
             logger.info(f"[MarkdownParser] Parse completed in {parse_time:.2f}s")
@@ -421,7 +426,12 @@ class MarkdownParser(BaseParser):
 
         return parts if parts else [content]
 
-    async def _ingest_local_images(self, root_dir: str, base_dir: Optional[Path] = None) -> None:
+    async def _ingest_local_images(
+        self,
+        root_dir: str,
+        base_dir: Optional[Path] = None,
+        allowed_media_dirs: Optional[List[Path]] = None,
+    ) -> None:
         """
         Scan every processed markdown file under ``root_dir`` and copy the local
         images they reference into VikingFS, next to the markdown file itself.
@@ -435,6 +445,8 @@ class MarkdownParser(BaseParser):
         Args:
             root_dir: Root directory URI in VikingFS containing the markdown files
             base_dir: Base directory for resolving relative paths
+            allowed_media_dirs: Additional directories from which derived media
+                may be read (passed through to ``_resolve_image_path``)
         """
         viking_fs = self._get_viking_fs()
 
@@ -473,7 +485,7 @@ class MarkdownParser(BaseParser):
                 if self._is_remote_uri(path_str):
                     continue
 
-                resolved_path = self._resolve_image_path(path_str, base_dir)
+                resolved_path = self._resolve_image_path(path_str, base_dir, allowed_media_dirs)
                 if resolved_path is None:
                     logger.warning(f"[MarkdownParser] Image file not found: {path_str}")
                     continue
@@ -535,13 +547,21 @@ class MarkdownParser(BaseParser):
                 json.dumps(mappings, ensure_ascii=False),
             )
 
-    def _resolve_image_path(self, path_str: str, base_dir: Optional[Path]) -> Optional[Path]:
+    def _resolve_image_path(
+        self,
+        path_str: str,
+        base_dir: Optional[Path],
+        allowed_media_dirs: Optional[List[Path]] = None,
+    ) -> Optional[Path]:
         """
         Resolve a local image reference to an existing filesystem path.
 
         Args:
             path_str: Raw image path from the markdown reference
             base_dir: Base directory for resolving relative paths
+            allowed_media_dirs: Additional directories that belong to the current
+                input resource's lifecycle (e.g. media extracted by the PDF/DOC
+                parser).
 
         Returns:
             Resolved absolute Path if the file exists and stays within an
@@ -561,9 +581,11 @@ class MarkdownParser(BaseParser):
             allowed_roots: list[Path] = []
             if base_dir:
                 allowed_roots.append(base_dir)
-            from openviking_cli.utils.storage import get_storage
-            storage = get_storage()
-            allowed_roots.append(storage.base_path)
+            if allowed_media_dirs:
+                allowed_roots.extend(allowed_media_dirs)
+
+            if not allowed_roots:
+                return None
 
             for root in allowed_roots:
                 candidate = (root / path).resolve()

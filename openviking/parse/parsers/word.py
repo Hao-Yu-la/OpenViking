@@ -60,6 +60,7 @@ class WordParser(BaseParser):
                 source_path=str(path),
                 instruction=instruction,
                 base_dir=path.parent,
+                allowed_media_dirs=[storage.media_dir],
                 **kwargs,
             )
         else:
@@ -166,7 +167,9 @@ class WordParser(BaseParser):
                 image_path = storage.save_image(
                     resource_name, image_bytes, filename=filename, extension=extension
                 )
-                rel_path = image_path.relative_to(Path.cwd())
+                # Reference relative to the media root so the MarkdownParser can
+                # resolve it within the resource's media lifecycle (never cwd).
+                rel_path = image_path.relative_to(storage.media_dir)
                 parts.append(f"![{filename}]({rel_path})")
             except Exception as e:
                 logger.warning(f"[WordParser] Failed to save embedded image {rid}: {e}")

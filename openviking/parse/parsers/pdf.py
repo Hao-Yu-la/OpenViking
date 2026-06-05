@@ -129,12 +129,16 @@ class PDFParser(BaseParser):
 
             # Step 2: Parse Markdown using MarkdownParser, pass through resource name
             md_parser = self._get_markdown_parser()
+            from openviking_cli.utils.storage import get_storage
+
+            storage = get_storage()
             result = await md_parser.parse_content(
                 markdown_content,
                 source_path=str(pdf_path),
                 resource_name=resource_name,
                 source_name=resource_name,
                 base_dir=pdf_path.parent,
+                allowed_media_dirs=[storage.media_dir],
             )
 
             # Step 3: Update metadata for PDF origin
@@ -338,8 +342,8 @@ class PDFParser(BaseParser):
                                         resource_name, image_obj, filename=filename
                                     )
 
-                                    # Generate relative path for markdown
-                                    rel_path = image_path.relative_to(Path.cwd())
+                                    # Generate path relative to the media root.
+                                    rel_path = image_path.relative_to(storage.media_dir)
                                     parts.append(
                                         f"<!-- Page {page_num} Image {img_idx + 1} -->\n"
                                         f"![Page {page_num} Image {img_idx + 1}]({rel_path})"
