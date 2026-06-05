@@ -31,12 +31,14 @@ pub mod error;
 pub mod object_store;
 pub mod ref_store;
 pub mod tree_builder;
+pub mod types;
 pub mod util;
 
 pub use error::{GitError, ObjectStoreError, RefStoreError};
 pub use object_store::ObjectStore;
 pub use ref_store::RefStore;
 pub use tree_builder::{flatten, lookup, TreeEditor};
+pub use types::{CommitRequest, CommitResponse, IndexEntry};
 
 // Re-exports from backends
 pub use backends::local::{LocalObjectStore, LocalRefStore};
