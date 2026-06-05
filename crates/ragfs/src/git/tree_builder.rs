@@ -131,6 +131,98 @@ impl TreeEditor {
         Ok(())
     }
 
+    /// Splice an existing subtree (referenced by its OID) into the editor at the
+    /// given path. The path's intermediate ancestors are created as needed.
+    ///
+    /// Any in-memory editor state under `path` is discarded — subsequent
+    /// `write()` calls will reference `subtree_oid` directly without rebuilding
+    /// the subtree. This is the API `restore` uses to swap a whole project
+    /// directory to a historical version without enumerating every file.
+    ///
+    /// Note: if you later call `upsert`/`remove` *inside* the spliced subtree
+    /// (e.g. `upsert_subtree("a/b", oid); upsert("a/b/x.txt", ...)`), the
+    /// in-memory state for "a/b" is rebuilt from those edits alone — the
+    /// contents of `subtree_oid` are not merged in. Splice, then edit, is a
+    /// destructive pattern.
+    pub fn upsert_subtree(
+        &mut self,
+        path: &str,
+        subtree_oid: ObjectId,
+    ) -> Result<(), GitError> {
+        let components = Self::split_path(path)?;
+        let (dirname, parent_dirs) = components
+            .split_last()
+            .ok_or_else(|| GitError::Other("empty path".into()))?;
+
+        // Ensure each ancestor directory has a Tree entry in its parent.
+        // The leaf Tree entry is inserted last, pointing at `subtree_oid`.
+        for depth in 1..=parent_dirs.len() {
+            let dir_name = parent_dirs[depth - 1];
+            let parent: &mut TreeEntries = if depth == 1 {
+                &mut self.root
+            } else {
+                let parent_key = Self::join_prefix(&parent_dirs[..depth - 1]);
+                self.subtrees.entry(parent_key).or_insert_with(BTreeMap::new)
+            };
+            match parent.get(dir_name.as_bytes().as_bstr()) {
+                Some(entry) if entry.mode != EntryKind::Tree.into() => {
+                    return Err(GitError::Other(format!(
+                        "path component '{dir_name}' is not a tree"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    parent.insert(
+                        dir_name.into(),
+                        tree::Entry {
+                            mode: EntryKind::Tree.into(),
+                            filename: dir_name.into(),
+                            oid: ObjectId::null(gix_hash::Kind::Sha1),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Insert the leaf Tree entry pointing at the precomputed subtree.
+        let leaf_entry = tree::Entry {
+            mode: EntryKind::Tree.into(),
+            filename: (*dirname).into(),
+            oid: subtree_oid,
+        };
+        let leaf_parent: &mut TreeEntries = if parent_dirs.is_empty() {
+            &mut self.root
+        } else {
+            let key = Self::join_prefix(parent_dirs);
+            self.subtrees.entry(key).or_insert_with(BTreeMap::new)
+        };
+        leaf_parent.insert((*dirname).into(), leaf_entry);
+
+        // Drop any stale in-memory state at or beneath `path` so write_subtree
+        // doesn't recurse — it will reuse `subtree_oid` directly.
+        let prefix = Self::join_prefix(&components);
+        let prefix_slash: Vec<u8> = {
+            let mut v = Vec::with_capacity(prefix.len() + 1);
+            v.extend_from_slice(prefix.as_slice());
+            v.push(b'/');
+            v
+        };
+        let to_remove: Vec<BString> = self
+            .subtrees
+            .keys()
+            .filter(|k| {
+                k.as_slice() == prefix.as_slice()
+                    || k.as_slice().starts_with(&prefix_slash)
+            })
+            .cloned()
+            .collect();
+        for k in to_remove {
+            self.subtrees.remove(&k);
+        }
+
+        Ok(())
+    }
+
     /// Load an existing tree from ObjectStore as the editing base.
     /// Recursively loads all subtrees into memory.
     pub async fn from_tree(
@@ -214,18 +306,27 @@ impl TreeEditor {
                         p
                     };
 
-                    if let Some(child_entries) = self.subtrees.get(&child_prefix) {
-                        if child_entries.is_empty() {
+                    match self.subtrees.get(&child_prefix) {
+                        Some(child_entries) if child_entries.is_empty() => {
+                            // Prune empty subtree.
                             continue;
                         }
+                        Some(_) => {
+                            // Subtree has in-memory edits — recurse to write them.
+                            let child_oid = self.write_subtree(store, account, &child_prefix).await?;
+                            result_entries.push(tree::Entry {
+                                mode: EntryKind::Tree.into(),
+                                filename: name,
+                                oid: child_oid,
+                            });
+                        }
+                        None => {
+                            // No in-memory state: use the entry's existing OID as-is
+                            // (e.g. placed by upsert_subtree or from_tree for untouched
+                            //  subtrees). This is the Fast Path 2 optimisation.
+                            result_entries.push(entry);
+                        }
                     }
-
-                    let child_oid = self.write_subtree(store, account, &child_prefix).await?;
-                    result_entries.push(tree::Entry {
-                        mode: EntryKind::Tree.into(),
-                        filename: name,
-                        oid: child_oid,
-                    });
                 } else {
                     result_entries.push(entry);
                 }
@@ -771,6 +872,112 @@ mod tests {
         assert_eq!(git_tree.entries[1].filename, "foo");
         assert!(git_tree.entries[0].mode.is_blob());
         assert!(git_tree.entries[1].mode.is_tree());
+    }
+
+    // --- Upsert subtree ---
+
+    #[tokio::test]
+    async fn test_upsert_subtree_root_level() {
+        let (_d, store) = make_store();
+        let mut editor = TreeEditor::empty();
+        let tree_oid = ObjectId::empty_tree(gix_hash::Kind::Sha1);
+
+        editor.upsert_subtree("subdir", tree_oid).unwrap();
+
+        assert_eq!(editor.root.len(), 1);
+        let entry = editor.root.get("subdir".as_bytes().as_bstr()).unwrap();
+        assert!(entry.mode.is_tree());
+        assert_eq!(entry.oid, tree_oid);
+
+        // write() should reuse the OID directly (no recursion into self.subtrees)
+        let root_oid = editor.write(&store, "acc").await.unwrap();
+        let root = load_tree(&store, "acc", &root_oid).await.unwrap();
+        assert_eq!(root.entries.len(), 1);
+        assert_eq!(root.entries[0].filename, "subdir");
+        assert_eq!(root.entries[0].oid, tree_oid);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subtree_nested() {
+        let (_d, store) = make_store();
+        let mut editor = TreeEditor::empty();
+        let tree_oid = ObjectId::empty_tree(gix_hash::Kind::Sha1);
+
+        editor.upsert_subtree("a/b/c", tree_oid).unwrap();
+
+        assert_eq!(editor.root.len(), 1);
+        assert!(editor.root.get("a".as_bytes().as_bstr()).unwrap().mode.is_tree());
+        assert!(editor.root.get("a".as_bytes().as_bstr()).unwrap().oid.is_null());
+
+        let a_sub = editor.subtrees.get("a".as_bytes().as_bstr()).unwrap();
+        assert_eq!(a_sub.len(), 1);
+        assert!(a_sub.get("b".as_bytes().as_bstr()).unwrap().mode.is_tree());
+
+        let ab_sub = editor.subtrees.get("a/b".as_bytes().as_bstr()).unwrap();
+        assert_eq!(ab_sub.len(), 1);
+        assert!(ab_sub.get("c".as_bytes().as_bstr()).unwrap().mode.is_tree());
+        assert_eq!(ab_sub.get("c".as_bytes().as_bstr()).unwrap().oid, tree_oid);
+
+        // No in-memory state for "a/b/c" — written directly.
+        assert!(editor.subtrees.get("a/b/c".as_bytes().as_bstr()).is_none());
+
+        let root_oid = editor.write(&store, "acc").await.unwrap();
+        let root = load_tree(&store, "acc", &root_oid).await.unwrap();
+        assert_eq!(root.entries.len(), 1);
+        let a_oid = root.entries[0].oid;
+        let a_tree = load_tree(&store, "acc", &a_oid).await.unwrap();
+        assert_eq!(a_tree.entries.len(), 1);
+        assert_eq!(a_tree.entries[0].filename, "b");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subtree_clears_existing_state() {
+        let (_d, store) = make_store();
+        let oid1 = oid_hex(b"1111111111111111111111111111111111111111");
+        let oid2 = oid_hex(b"2222222222222222222222222222222222222222");
+
+        // Build editor with a/b/x.txt and a/b/y.txt
+        let mut editor = TreeEditor::empty();
+        editor.upsert("a/b/x.txt", oid1).unwrap();
+        editor.upsert("a/b/y.txt", oid2).unwrap();
+        assert!(editor.subtrees.contains_key("a/b".as_bytes().as_bstr()));
+
+        // Replace a/b with an empty subtree
+        let empty_tree = ObjectId::empty_tree(gix_hash::Kind::Sha1);
+        editor.upsert_subtree("a/b", empty_tree).unwrap();
+
+        // Stale "a/b" subtree should be gone
+        assert!(editor.subtrees.get("a/b".as_bytes().as_bstr()).is_none());
+
+        let root_oid = editor.write(&store, "acc").await.unwrap();
+        let root = load_tree(&store, "acc", &root_oid).await.unwrap();
+        let b_entry = root.entries.iter().find(|e| e.filename == "a").unwrap();
+        let a_tree = load_tree(&store, "acc", &b_entry.oid).await.unwrap();
+        assert_eq!(a_tree.entries.len(), 1);
+        assert_eq!(a_tree.entries[0].filename, "b");
+        assert_eq!(a_tree.entries[0].oid, empty_tree);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_subtree_then_upsert_inside() {
+        let (_d, store) = make_store();
+        let oid = oid_hex(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let mut editor = TreeEditor::empty();
+        editor.upsert_subtree("a/b", ObjectId::empty_tree(gix_hash::Kind::Sha1)).unwrap();
+
+        // Upsert inside the spliced subtree creates new in-memory state from scratch.
+        editor.upsert("a/b/c.txt", oid).unwrap();
+
+        let root_oid = editor.write(&store, "acc").await.unwrap();
+        let root = load_tree(&store, "acc", &root_oid).await.unwrap();
+        let a_entry = root.entries.iter().find(|e| e.filename == "a").unwrap();
+        let a_tree = load_tree(&store, "acc", &a_entry.oid).await.unwrap();
+        let b_entry = a_tree.entries.iter().find(|e| e.filename == "b").unwrap();
+        let b_tree = load_tree(&store, "acc", &b_entry.oid).await.unwrap();
+        assert_eq!(b_tree.entries.len(), 1);
+        assert_eq!(b_tree.entries[0].filename, "c.txt");
+        assert_eq!(b_tree.entries[0].oid, oid);
     }
 
     // --- Integration ---
