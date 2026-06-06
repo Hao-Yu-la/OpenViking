@@ -1995,6 +1995,116 @@ mod tests {
             other => panic!("expected ConcurrentCommit, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn test_restore_does_not_touch_paths_outside_project_dir() {
+        let (_dir, vfs, object_store, _ref_store, svc) = make_service("acct");
+
+        // Source: resources/proj_a + an UNRELATED file in another scope.
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        vfs.put("agent/skills/unrelated.py", b"unrelated v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        // HEAD: modify proj_a AND the unrelated file. Note we don't delete
+        // anything in this test, so make_commit (which uses collect_all) is
+        // fine — all files still exist in the VFS.
+        vfs.put("resources/proj_a/a.md", b"A v2");
+        vfs.put("agent/skills/unrelated.py", b"unrelated v2");
+        vfs.put("agent/skills/new_skill.py", b"brand new");
+        let _ = make_commit(&svc, "acct", "main", "head").await;
+
+        let resp = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: None,
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap();
+
+        let new_oid = match resp {
+            RestoreResponse::Applied { new_commit_oid, .. } => new_commit_oid,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+        // Verify the VFS: unrelated files keep their v2 / new state.
+        let files = vfs.files.lock().unwrap();
+        assert_eq!(
+            files.get("/local/acct/agent/skills/unrelated.py").unwrap(),
+            b"unrelated v2",
+            "restore must NOT roll back unrelated.py",
+        );
+        assert!(
+            files.contains_key("/local/acct/agent/skills/new_skill.py"),
+            "restore must NOT delete new_skill.py",
+        );
+        // And proj_a/a.md DID roll back.
+        assert_eq!(
+            files.get("/local/acct/resources/proj_a/a.md").unwrap(),
+            b"A v1",
+        );
+        drop(files);
+
+        // Verify the tree: the new commit's tree should contain the v2 content
+        // of unrelated.py and new_skill.py at their original oids. The easiest
+        // way: lookup the oid of agent/skills/unrelated.py in both source and
+        // new — they must DIFFER (source had v1, new still has v2).
+        let new_tree = load_commit_meta(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            &new_oid,
+        )
+        .await
+        .unwrap()
+        .tree;
+        let source_tree = load_commit_meta(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            &source_oid,
+        )
+        .await
+        .unwrap()
+        .tree;
+        let unrelated_in_new = crate::git::tree_builder::lookup(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            new_tree,
+            "agent/skills/unrelated.py",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let unrelated_in_source = crate::git::tree_builder::lookup(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            source_tree,
+            "agent/skills/unrelated.py",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            unrelated_in_new.0, unrelated_in_source.0,
+            "agent/skills/unrelated.py in the new tree must be HEAD's v2 oid, not source's v1 oid",
+        );
+        assert!(
+            crate::git::tree_builder::lookup(
+                object_store.as_ref() as &dyn ObjectStore,
+                "acct",
+                new_tree,
+                "agent/skills/new_skill.py",
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "new_skill.py must still be present in the new tree",
+        );
+    }
 }
 
 #[cfg(test)]
