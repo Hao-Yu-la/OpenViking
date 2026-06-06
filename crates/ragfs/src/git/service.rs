@@ -1812,6 +1812,41 @@ mod tests {
             "c.md deleted",
         );
     }
+
+    #[tokio::test]
+    async fn test_restore_noop_when_source_equals_head() {
+        let (_dir, vfs, _object_store, ref_store, svc) = make_service("acct");
+        vfs.put("resources/proj_a/a.md", b"only file");
+        let only_oid = make_commit(&svc, "acct", "main", "only").await;
+
+        // No further changes to proj_a — restoring from `only_oid` is a noop.
+        let resp = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: only_oid.to_hex().to_string(),
+                dry_run: false,
+                message: None,
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .unwrap();
+
+        match resp {
+            RestoreResponse::Noop { head, source } => {
+                assert_eq!(head, only_oid);
+                assert_eq!(source, only_oid);
+            }
+            other => panic!("expected Noop, got {other:?}"),
+        }
+        // Ref unchanged.
+        assert_eq!(
+            ref_store.read("acct", "refs/heads/main").await.unwrap(),
+            only_oid
+        );
+    }
 }
 
 #[cfg(test)]
