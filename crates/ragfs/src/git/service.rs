@@ -15,7 +15,7 @@ use crate::git::{
     error::{GitError, RefStoreError},
     object_store::ObjectStore,
     ref_store::RefStore,
-    types::{CommitRequest, CommitResponse, ShowRequest, ShowResponse},
+    types::{CommitRequest, CommitResponse, RestoreRequest, RestoreResponse, ShowRequest, ShowResponse},
 };
 
 /// `GitService` orchestrates the full commit pipeline against a `FileSystem`
@@ -267,6 +267,114 @@ impl GitService {
                 })
             }
         }
+    }
+
+    /// Restore a subtree at `project_dir` to the state it had in `source_commit`,
+    /// producing a new commit whose parent is the **current HEAD** (not
+    /// `source_commit`). HEAD always moves forward.
+    ///
+    /// See design §8.2 for the full algorithm and `RestoreResponse` for the
+    /// three possible outcomes (`Applied` / `Noop` / `DryRun`).
+    ///
+    /// Errors:
+    /// - `GitError::InvalidProjectDir` — `project_dir` is empty / malformed.
+    /// - `GitError::RefStore(NotFound)` — branch HEAD or source_commit ref missing.
+    /// - `GitError::SubtreeNotFoundInCommit` — `project_dir` does not resolve
+    ///   to a subtree in `source_commit`'s tree.
+    /// - `GitError::ConcurrentCommit` — branch ref changed between our read
+    ///   and the CAS swap.
+    pub async fn restore(&self, req: RestoreRequest) -> Result<RestoreResponse, GitError> {
+        let RestoreRequest {
+            account,
+            branch,
+            project_dir,
+            source_commit,
+            dry_run,
+            message: _,
+            author_name: _,
+            author_email: _,
+        } = &req;
+
+        validate_project_dir(project_dir)?;
+        let ref_name = format!("refs/heads/{branch}");
+
+        // 1. Resolve both commits.
+        let source_oid = resolve_ref(self.ref_store.as_ref(), account, source_commit).await?;
+        let head_oid = self.ref_store.read(account, &ref_name).await?;
+        let source_meta = load_commit_meta(self.object_store.as_ref(), account, &source_oid).await?;
+        let head_meta = load_commit_meta(self.object_store.as_ref(), account, &head_oid).await?;
+
+        // 2. Extract project_dir subtree from each. Source missing → error.
+        //    Head missing → treat as empty (every file is a fresh write).
+        let source_subtree = match crate::git::tree_builder::lookup(
+            self.object_store.as_ref(),
+            account,
+            source_meta.tree,
+            project_dir,
+        )
+        .await?
+        {
+            Some((oid, mode)) if mode.is_tree() => oid,
+            _ => {
+                return Err(GitError::SubtreeNotFoundInCommit {
+                    project_dir: project_dir.clone(),
+                    commit: source_oid,
+                });
+            }
+        };
+        let head_subtree = match crate::git::tree_builder::lookup(
+            self.object_store.as_ref(),
+            account,
+            head_meta.tree,
+            project_dir,
+        )
+        .await?
+        {
+            Some((oid, mode)) if mode.is_tree() => Some(oid),
+            _ => None,
+        };
+
+        // 3. Flatten and diff (paths in the result are subtree-relative).
+        let source_entries = crate::git::tree_builder::flatten(
+            self.object_store.as_ref(),
+            account,
+            source_subtree,
+            &None,
+        )
+        .await?;
+        let head_entries = match head_subtree {
+            Some(oid) => {
+                crate::git::tree_builder::flatten(
+                    self.object_store.as_ref(),
+                    account,
+                    oid,
+                    &None,
+                )
+                .await?
+            }
+            None => Vec::new(),
+        };
+        let diff = compute_subtree_diff(&source_entries, &head_entries);
+
+        // 4. dry_run short-circuits BEFORE any writes.
+        if *dry_run {
+            return Ok(RestoreResponse::DryRun {
+                diff,
+                head: head_oid,
+                source: source_oid,
+            });
+        }
+
+        // 5. Source == head → noop.
+        if diff.to_write.is_empty() && diff.to_delete.is_empty() {
+            return Ok(RestoreResponse::Noop {
+                head: head_oid,
+                source: source_oid,
+            });
+        }
+
+        // TODO(Task 6): apply path — VFS writeback, tree splice, new commit, CAS.
+        Err(GitError::Other("restore apply path not yet implemented".into()))
     }
 }
 
@@ -1400,6 +1508,86 @@ mod tests {
         FileSystem::remove(vfs.as_ref(), path).await.unwrap();
         let err = FileSystem::read(vfs.as_ref(), path, 0, 0).await.unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    // ── restore: dry_run ───────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_restore_dry_run_reports_diff_and_writes_nothing() {
+        let (_dir, vfs, object_store, ref_store, svc) = make_service("acct");
+        // Source state: resources/proj_a has files a.md, b.md
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        vfs.put("resources/proj_a/b.md", b"B v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        // HEAD state: a.md is rewritten, b.md is deleted, c.md is created.
+        // We pass explicit paths (including the deleted b.md) so commit()
+        // sees the tombstone — collect_all() only enumerates surviving files.
+        vfs.put("resources/proj_a/a.md", b"A v2");
+        vfs.delete("resources/proj_a/b.md");
+        vfs.put("resources/proj_a/c.md", b"C new");
+        let head_oid = match svc
+            .commit(req(
+                "acct",
+                "main",
+                "head",
+                Some(vec![
+                    "resources/proj_a/a.md".to_string(),
+                    "resources/proj_a/b.md".to_string(),
+                    "resources/proj_a/c.md".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap()
+        {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let resp = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: true,
+                message: None,
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .unwrap();
+
+        match resp {
+            RestoreResponse::DryRun { diff, head, source } => {
+                assert_eq!(source, source_oid);
+                assert_eq!(head, head_oid);
+                // a.md needs to roll back to v1, b.md needs to come back,
+                // c.md needs to go away. Sorted alphabetically by path.
+                assert_eq!(diff.to_write.len(), 2);
+                assert_eq!(diff.to_write[0].0, "a.md");
+                assert_eq!(diff.to_write[1].0, "b.md");
+                assert_eq!(diff.to_delete, vec!["c.md".to_string()]);
+                assert!(diff.unchanged.is_empty());
+            }
+            other => panic!("expected DryRun, got {other:?}"),
+        }
+
+        // CRITICAL: dry_run wrote nothing through the VFS — c.md and the v2
+        // version of a.md must still be visible on disk.
+        let files = vfs.files.lock().unwrap();
+        assert_eq!(
+            files.get("/local/acct/resources/proj_a/a.md").unwrap(),
+            b"A v2",
+            "dry_run must not overwrite a.md",
+        );
+        assert!(
+            files.contains_key("/local/acct/resources/proj_a/c.md"),
+            "dry_run must not delete c.md",
+        );
+        // Branch ref must still point at head_oid.
+        let head_after = ref_store.read("acct", "refs/heads/main").await.unwrap();
+        assert_eq!(head_after, head_oid);
+        let _ = object_store; // silence unused warning
     }
 }
 
