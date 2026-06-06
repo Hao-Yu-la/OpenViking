@@ -71,6 +71,12 @@ pub enum GitError {
     #[error("path not found in tree: {0}")]
     PathNotFound(String),
 
+    /// Path exists in tree but resolves to a directory (tree), not a blob.
+    /// Returned by `show()` when the caller asked for blob bytes at a path
+    /// that turned out to be a subdirectory.
+    #[error("path is a directory, not a file: {0}")]
+    PathIsDirectory(String),
+
     /// Invalid account ID
     #[error("invalid account id: {0}")]
     InvalidAccountId(String),

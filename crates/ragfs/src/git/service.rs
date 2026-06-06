@@ -214,8 +214,8 @@ impl GitService {
     /// - `path = None`  → returns `ShowResponse::Commit { oid, tree, parents, author, committer, message }`.
     /// - `path = Some(p)` → returns `ShowResponse::Blob { oid, size, bytes }` for the path inside
     ///   the commit's tree. Missing path → `GitError::PathNotFound(p)`. Path that resolves to
-    ///   a tree (not a blob) → `GitError::PathNotFound(p)` (treat the same as missing — callers
-    ///   asked for blob bytes, not a directory listing).
+    ///   a tree (not a blob) → `GitError::PathIsDirectory(p)` — distinct from missing so callers
+    ///   can tell apart "no such path" from "path exists but is a directory, not a file".
     ///
     /// Missing ref → `GitError::RefStore(RefStoreError::NotFound)`.
     /// Missing commit object → `GitError::ObjectStore(ObjectStoreError::NotFound)`.
@@ -244,7 +244,7 @@ impl GitService {
                 let (blob_oid, mode) = entry.ok_or_else(|| GitError::PathNotFound(p.clone()))?;
                 // Reject trees masquerading as paths: callers asked for blob bytes.
                 if mode.is_tree() {
-                    return Err(GitError::PathNotFound(p));
+                    return Err(GitError::PathIsDirectory(p));
                 }
                 let raw = crate::git::util::read_object(
                     self.object_store.as_ref(),
@@ -991,8 +991,8 @@ mod tests {
             .unwrap_err();
 
         match err {
-            GitError::PathNotFound(p) => assert_eq!(p, "resources"),
-            other => panic!("expected PathNotFound, got {other:?}"),
+            GitError::PathIsDirectory(p) => assert_eq!(p, "resources"),
+            other => panic!("expected PathIsDirectory, got {other:?}"),
         }
     }
 
