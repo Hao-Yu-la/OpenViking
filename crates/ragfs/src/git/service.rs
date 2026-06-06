@@ -257,7 +257,9 @@ impl GitService {
                         "expected blob at {p}, got {kind:?}"
                     )));
                 }
-                let bytes = raw[hdr..].to_vec();
+                // `raw` is already a `Bytes`; `slice` is O(1) and shares the
+                // backing buffer instead of allocating a fresh payload copy.
+                let bytes = raw.slice(hdr..);
                 Ok(ShowResponse::Blob {
                     oid: blob_oid,
                     size: payload_size,
@@ -1016,7 +1018,7 @@ mod tests {
 
         match resp {
             ShowResponse::Blob { bytes, size, oid: _ } => {
-                assert_eq!(bytes, body.to_vec());
+                assert_eq!(bytes.as_ref(), body);
                 assert_eq!(size, body.len() as u64);
             }
             other => panic!("expected Blob, got {other:?}"),

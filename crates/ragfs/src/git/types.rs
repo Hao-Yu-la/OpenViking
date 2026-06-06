@@ -56,7 +56,12 @@ pub enum ShowResponse {
     Blob {
         oid: ObjectId,
         size: u64,
-        bytes: Vec<u8>,
+        /// Zero-copy slice over the decompressed object buffer (header + payload).
+        /// Cloning is `Arc::clone` — cheap; cloning a `Vec` of the same size is not.
+        /// The few bytes of the loose-object header upstream of the payload remain
+        /// alive in the backing buffer until the last `Bytes` handle is dropped;
+        /// negligible compared to the payload itself.
+        bytes: bytes::Bytes,
     },
 }
 

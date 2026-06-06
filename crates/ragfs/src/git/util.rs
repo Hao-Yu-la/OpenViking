@@ -52,9 +52,17 @@ pub fn zlib_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
 }
 
 /// Decompress zlib-compressed data (for reading Git loose objects).
+///
+/// Pre-allocates a generous output buffer to amortize the `Vec` doubling cost
+/// that hurts large blobs (a 100 MiB payload otherwise triggers ~27 reallocs).
+/// The hint assumes a worst-case compression ratio of ~4×; capped at 64 MiB
+/// so a pathologically small-but-compressible header doesn't reserve absurd
+/// amounts of memory. Exceeding the hint still works — `Vec` will grow.
 pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    const HINT_CAP: usize = 64 * 1024 * 1024;
+    let hint = data.len().saturating_mul(4).min(HINT_CAP);
+    let mut decoded = Vec::with_capacity(hint);
     let mut decoder = flate2::read::ZlibDecoder::new(data);
-    let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded)?;
     Ok(decoded)
 }
