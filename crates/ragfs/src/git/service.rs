@@ -360,6 +360,27 @@ fn is_not_found(e: &crate::core::errors::Error) -> bool {
     matches!(e, crate::core::errors::Error::NotFound(_))
 }
 
+/// Validate `project_dir` matches the rules of `TreeEditor::upsert`:
+/// non-empty, no leading/trailing `/`, no empty components.
+fn validate_project_dir(project_dir: &str) -> Result<(), GitError> {
+    if project_dir.is_empty() {
+        return Err(GitError::InvalidProjectDir(
+            "project_dir must be non-empty".into(),
+        ));
+    }
+    if project_dir.starts_with('/') || project_dir.ends_with('/') {
+        return Err(GitError::InvalidProjectDir(format!(
+            "project_dir must not start or end with '/': {project_dir:?}"
+        )));
+    }
+    if project_dir.split('/').any(|c| c.is_empty()) {
+        return Err(GitError::InvalidProjectDir(format!(
+            "project_dir contains empty segment: {project_dir:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Pure-function diff between two flattened subtrees.
 ///
 /// Both inputs are `(path, oid)` slices as returned by `tree_builder::flatten`
@@ -1455,6 +1476,46 @@ mod diff_tests {
         );
         assert!(got.to_delete.is_empty());
         assert_eq!(got.unchanged, vec!["docs/a.md".to_string()]);
+    }
+
+    #[test]
+    fn validate_rejects_empty_string() {
+        let err = validate_project_dir("").unwrap_err();
+        assert!(matches!(err, GitError::InvalidProjectDir(_)));
+    }
+
+    #[test]
+    fn validate_rejects_leading_slash() {
+        assert!(matches!(
+            validate_project_dir("/resources/proj_a").unwrap_err(),
+            GitError::InvalidProjectDir(_)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_trailing_slash() {
+        assert!(matches!(
+            validate_project_dir("resources/proj_a/").unwrap_err(),
+            GitError::InvalidProjectDir(_)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_double_slash() {
+        assert!(matches!(
+            validate_project_dir("resources//proj_a").unwrap_err(),
+            GitError::InvalidProjectDir(_)
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_simple_path() {
+        validate_project_dir("resources/proj_a").unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_single_segment() {
+        validate_project_dir("resources").unwrap();
     }
 }
 
