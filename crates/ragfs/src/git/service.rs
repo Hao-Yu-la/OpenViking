@@ -373,9 +373,136 @@ impl GitService {
             });
         }
 
-        // TODO(Task 6): apply path — VFS writeback, tree splice, new commit, CAS.
-        Err(GitError::Other("restore apply path not yet implemented".into()))
+        // 6. Read blob bytes for to_write entries, then writeback through VFS.
+        //    Paths in the diff are relative to project_dir — prefix here.
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        let abs_prefix = format!("/local/{}/{}", account, project_dir);
+        let writes_planned = diff.to_write.len();
+        let deletes_planned = diff.to_delete.len();
+        let unchanged_count = diff.unchanged.len();
+
+        let object_store_ref = self.object_store.clone();
+        let vfs_ref = self.vfs.clone();
+        let account_owned = account.clone();
+        let abs_prefix_for_writes = abs_prefix.clone();
+
+        stream::iter(diff.to_write.clone().into_iter())
+            .map(|(rel, blob_oid)| {
+                let object_store = object_store_ref.clone();
+                let vfs = vfs_ref.clone();
+                let account = account_owned.clone();
+                let abs_prefix = abs_prefix_for_writes.clone();
+                async move {
+                    let bytes =
+                        read_blob_payload(object_store.as_ref(), &account, &blob_oid).await?;
+                    let abs = format!("{}/{}", abs_prefix, rel);
+                    crate::core::filesystem::FileSystem::write(
+                        vfs.as_ref(),
+                        &abs,
+                        &bytes,
+                        0,
+                        crate::core::types::WriteFlag::Create,
+                    )
+                    .await?;
+                    Ok::<(), GitError>(())
+                }
+            })
+            .buffer_unordered(32)
+            .try_collect::<()>()
+            .await?;
+
+        let abs_prefix_for_deletes = abs_prefix.clone();
+        let vfs_for_deletes = self.vfs.clone();
+        stream::iter(diff.to_delete.clone().into_iter())
+            .map(|rel| {
+                let vfs = vfs_for_deletes.clone();
+                let abs_prefix = abs_prefix_for_deletes.clone();
+                async move {
+                    let abs = format!("{}/{}", abs_prefix, rel);
+                    crate::core::filesystem::FileSystem::remove(vfs.as_ref(), &abs).await?;
+                    Ok::<(), GitError>(())
+                }
+            })
+            .buffer_unordered(32)
+            .try_collect::<()>()
+            .await?;
+
+        // 7. Build the new tree: load head.tree into an editor and splice
+        //    source_subtree at project_dir.
+        let mut editor = crate::git::tree_builder::TreeEditor::from_tree(
+            self.object_store.as_ref(),
+            account,
+            head_meta.tree,
+        )
+        .await?;
+        editor.upsert_subtree(project_dir, source_subtree)?;
+        let new_tree_oid = editor.write(self.object_store.as_ref(), account).await?;
+
+        // 8. Construct the new commit. parent = head_oid (NOT source_oid).
+        let msg = req.message.clone().unwrap_or_else(|| {
+            format!(
+                "restore {} from {}",
+                project_dir,
+                &source_oid.to_hex().to_string()[..12.min(40)]
+            )
+        });
+        let new_commit_oid = crate::git::commit::write_commit(
+            self.object_store.as_ref(),
+            account,
+            new_tree_oid,
+            vec![head_oid],
+            &req.author_name,
+            &req.author_email,
+            &msg,
+        )
+        .await?;
+
+        // 9. CAS-swap the branch ref. Map Conflict → ConcurrentCommit.
+        match self
+            .ref_store
+            .cas_update(account, &ref_name, Some(head_oid), new_commit_oid)
+            .await
+        {
+            Ok(()) => {}
+            Err(crate::git::error::RefStoreError::Conflict { expected, actual }) => {
+                return Err(GitError::ConcurrentCommit {
+                    ref_name,
+                    expected,
+                    actual,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+
+        Ok(RestoreResponse::Applied {
+            new_commit_oid,
+            source_commit: source_oid,
+            parent_commit: head_oid,
+            written: writes_planned,
+            deleted: deletes_planned,
+            unchanged: unchanged_count,
+        })
     }
+}
+
+/// Load a blob object and return only its payload bytes (header stripped).
+///
+/// Errors out with `CorruptedObject` if the loaded object is not a blob —
+/// this should not happen on a well-formed store but is cheap to verify.
+async fn read_blob_payload(
+    store: &dyn ObjectStore,
+    account: &str,
+    blob_oid: &gix_hash::ObjectId,
+) -> Result<bytes::Bytes, GitError> {
+    let raw = crate::git::util::read_object(store, account, blob_oid).await?;
+    let (kind, _, hdr) = crate::git::util::parse_object_header(&raw)?;
+    if kind != gix_object::Kind::Blob {
+        return Err(GitError::CorruptedObject(format!(
+            "expected blob, got {kind:?}"
+        )));
+    }
+    Ok(raw.slice(hdr..))
 }
 
 /// Resolve `target_ref` to a commit OID.
@@ -1588,6 +1715,102 @@ mod tests {
         let head_after = ref_store.read("acct", "refs/heads/main").await.unwrap();
         assert_eq!(head_after, head_oid);
         let _ = object_store; // silence unused warning
+    }
+
+    // ── restore: apply ─────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_restore_apply_writes_new_commit_with_head_as_parent() {
+        let (_dir, vfs, object_store, ref_store, svc) = make_service("acct");
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        vfs.put("resources/proj_a/b.md", b"B v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        vfs.put("resources/proj_a/a.md", b"A v2");
+        vfs.delete("resources/proj_a/b.md");
+        vfs.put("resources/proj_a/c.md", b"C new");
+        // IMPORTANT: use explicit paths so the deletion of b.md is captured
+        let head_oid = match svc
+            .commit(req(
+                "acct",
+                "main",
+                "head",
+                Some(vec![
+                    "resources/proj_a/a.md".to_string(),
+                    "resources/proj_a/b.md".to_string(),
+                    "resources/proj_a/c.md".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap()
+        {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let resp = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: Some("rewind proj_a".into()),
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .unwrap();
+
+        let new_oid = match resp {
+            RestoreResponse::Applied {
+                new_commit_oid,
+                source_commit,
+                parent_commit,
+                written,
+                deleted,
+                unchanged,
+            } => {
+                assert_eq!(source_commit, source_oid);
+                assert_eq!(parent_commit, head_oid, "parent MUST be HEAD, NOT source");
+                assert_eq!(written, 2, "a.md (rewrite) + b.md (recreate) = 2");
+                assert_eq!(deleted, 1, "c.md");
+                assert_eq!(unchanged, 0);
+                new_commit_oid
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+        // Ref now points at new_oid.
+        assert_eq!(
+            ref_store.read("acct", "refs/heads/main").await.unwrap(),
+            new_oid
+        );
+        // New commit's parents = [head_oid] (NOT source_oid — this is the key
+        // invariant of restore vs. plain checkout).
+        let parents = commit_parents(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            new_oid,
+        )
+        .await;
+        assert_eq!(parents, vec![head_oid]);
+
+        // VFS rolled back as expected.
+        let files = vfs.files.lock().unwrap();
+        assert_eq!(
+            files.get("/local/acct/resources/proj_a/a.md").unwrap(),
+            b"A v1",
+            "a.md rolled back",
+        );
+        assert_eq!(
+            files.get("/local/acct/resources/proj_a/b.md").unwrap(),
+            b"B v1",
+            "b.md restored",
+        );
+        assert!(
+            !files.contains_key("/local/acct/resources/proj_a/c.md"),
+            "c.md deleted",
+        );
     }
 }
 
