@@ -468,8 +468,9 @@ mod tests {
         async fn mkdir(&self, _path: &str, _mode: u32) -> Result<()> {
             unimplemented!()
         }
-        async fn remove(&self, _path: &str) -> Result<()> {
-            unimplemented!()
+        async fn remove(&self, path: &str) -> Result<()> {
+            self.files.lock().unwrap().remove(path);
+            Ok(())
         }
         async fn remove_all(&self, _path: &str) -> Result<()> {
             unimplemented!()
@@ -485,12 +486,16 @@ mod tests {
 
         async fn write(
             &self,
-            _path: &str,
-            _data: &[u8],
+            path: &str,
+            data: &[u8],
             _offset: u64,
             _flags: WriteFlag,
         ) -> Result<u64> {
-            unimplemented!()
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), data.to_vec());
+            Ok(data.len() as u64)
         }
         async fn read_dir(&self, _path: &str) -> Result<Vec<FileInfo>> {
             unimplemented!()
@@ -1380,6 +1385,21 @@ mod tests {
             }
             other => panic!("expected ObjectStore(NotFound), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_mock_vfs_write_then_read_round_trip() {
+        let vfs = MockVfs::new("acct");
+        let path = "/local/acct/x.md";
+        vfs.files.lock().unwrap().insert(path.to_string(), Vec::new());
+        FileSystem::write(vfs.as_ref(), path, b"hello", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        let got = FileSystem::read(vfs.as_ref(), path, 0, 0).await.unwrap();
+        assert_eq!(got, b"hello");
+        FileSystem::remove(vfs.as_ref(), path).await.unwrap();
+        let err = FileSystem::read(vfs.as_ref(), path, 0, 0).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
     }
 }
 
