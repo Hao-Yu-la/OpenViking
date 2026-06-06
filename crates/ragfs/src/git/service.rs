@@ -72,7 +72,9 @@ impl GitService {
         };
         let prev_tree: Option<ObjectId> = match prev_head {
             Some(commit_oid) => Some(
-                load_commit_tree(self.object_store.as_ref(), &account, &commit_oid).await?,
+                load_commit_meta(self.object_store.as_ref(), &account, &commit_oid)
+                    .await?
+                    .tree,
             ),
             None => None,
         };
@@ -206,12 +208,59 @@ impl GitService {
     }
 }
 
-/// Read a commit object and return its tree OID.
-async fn load_commit_tree(
+/// Resolve `target_ref` to a commit OID.
+///
+/// Accepts:
+///   1. 40-hex commit OID (validated by `ObjectId::from_hex`)
+///   2. Full ref path beginning with `refs/` (passed through `validate_ref_name`,
+///      then read from `ref_store`)
+///   3. Short branch name (e.g. "main") — auto-prefixed to `refs/heads/{name}`,
+///      validated, then read from `ref_store`
+///
+/// Returns `RefStoreError::NotFound` (wrapped) if the ref doesn't exist;
+/// `GitError::Other` if `target_ref` is neither a valid OID nor a valid ref name.
+#[allow(dead_code)] // wired up by GitService::show in Task 3
+async fn resolve_ref(
+    ref_store: &dyn RefStore,
+    account: &str,
+    target_ref: &str,
+) -> Result<ObjectId, GitError> {
+    // 1. 40-hex commit OID — accept only lowercase hex of exactly len 40.
+    if target_ref.len() == 40 && target_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return ObjectId::from_hex(target_ref.as_bytes())
+            .map_err(|e| GitError::Other(format!("invalid oid {target_ref}: {e}")));
+    }
+
+    // 2 & 3. Normalize to full ref path then read.
+    let full = if target_ref.starts_with("refs/") {
+        target_ref.to_string()
+    } else {
+        format!("refs/heads/{target_ref}")
+    };
+    crate::git::util::validate_ref_name(&full)?;
+    Ok(ref_store.read(account, &full).await?)
+}
+
+/// Decoded commit metadata used by `commit()` (just the tree) and `show()`
+/// (full set). Owned so callers don't have to juggle the raw buffer.
+struct CommitMeta {
+    tree: ObjectId,
+    #[allow(dead_code)] // consumed by GitService::show in Task 3
+    parents: Vec<ObjectId>,
+    #[allow(dead_code)]
+    author: crate::git::types::Actor,
+    #[allow(dead_code)]
+    committer: crate::git::types::Actor,
+    #[allow(dead_code)]
+    message: String,
+}
+
+/// Read a commit object and return its decoded metadata.
+async fn load_commit_meta(
     store: &dyn ObjectStore,
     account: &str,
     commit_oid: &ObjectId,
-) -> Result<ObjectId, GitError> {
+) -> Result<CommitMeta, GitError> {
     let raw = crate::git::util::read_object(store, account, commit_oid).await?;
     let (kind, _, hdr) = crate::git::util::parse_object_header(&raw)?;
     if kind != gix_object::Kind::Commit {
@@ -221,7 +270,27 @@ async fn load_commit_tree(
     }
     let parsed = gix_object::CommitRef::from_bytes(&raw[hdr..])
         .map_err(|e| GitError::Other(format!("commit decode: {e}")))?;
-    Ok(parsed.tree())
+    Ok(CommitMeta {
+        tree: parsed.tree(),
+        parents: parsed.parents().collect(),
+        author: actor_from_signature_ref(&parsed.author),
+        committer: actor_from_signature_ref(&parsed.committer),
+        message: parsed.message.to_string(),
+    })
+}
+
+/// Project a borrowed `gix_actor::SignatureRef` into our owned `Actor` DTO.
+///
+/// gix-actor 0.31.5 fields used: `SignatureRef.name: &BStr`, `.email: &BStr`,
+/// `.time: gix_date::Time` (not the raw `&str` of later versions). `Time`
+/// provides `.seconds: i64` and `.offset: i32`.
+fn actor_from_signature_ref(sig: &gix_actor::SignatureRef<'_>) -> crate::git::types::Actor {
+    crate::git::types::Actor {
+        name: sig.name.to_string(),
+        email: sig.email.to_string(),
+        time_seconds: sig.time.seconds,
+        tz_offset_seconds: sig.time.offset,
+    }
 }
 
 /// Return true iff `e` is `Error::NotFound(_)`.
@@ -425,7 +494,10 @@ mod tests {
         account: &str,
         commit_oid: ObjectId,
     ) -> ObjectId {
-        load_commit_tree(store, account, &commit_oid).await.unwrap()
+        load_commit_meta(store, account, &commit_oid)
+            .await
+            .unwrap()
+            .tree
     }
 
     // ── 1 ──────────────────────────────────────────────────────────────
