@@ -360,6 +360,41 @@ fn is_not_found(e: &crate::core::errors::Error) -> bool {
     matches!(e, crate::core::errors::Error::NotFound(_))
 }
 
+/// Pure-function diff between two flattened subtrees.
+///
+/// Both inputs are `(path, oid)` slices as returned by `tree_builder::flatten`
+/// on a subtree OID — meaning the paths are already relative to the subtree
+/// root (no `project_dir` prefix). Results are sorted by path.
+fn compute_subtree_diff(
+    source: &[(String, gix_hash::ObjectId)],
+    head: &[(String, gix_hash::ObjectId)],
+) -> crate::git::types::RestoreDiff {
+    use std::collections::HashMap;
+    let head_map: HashMap<&str, &gix_hash::ObjectId> =
+        head.iter().map(|(p, o)| (p.as_str(), o)).collect();
+    let source_map: HashMap<&str, &gix_hash::ObjectId> =
+        source.iter().map(|(p, o)| (p.as_str(), o)).collect();
+
+    let mut to_write = Vec::new();
+    let mut unchanged = Vec::new();
+    for (path, oid) in source {
+        match head_map.get(path.as_str()) {
+            Some(head_oid) if *head_oid == oid => unchanged.push(path.clone()),
+            _ => to_write.push((path.clone(), *oid)),
+        }
+    }
+    let mut to_delete: Vec<String> = head
+        .iter()
+        .filter(|(p, _)| !source_map.contains_key(p.as_str()))
+        .map(|(p, _)| p.clone())
+        .collect();
+
+    to_write.sort_by(|a, b| a.0.cmp(&b.0));
+    to_delete.sort();
+    unchanged.sort();
+    crate::git::types::RestoreDiff { to_write, to_delete, unchanged }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,3 +1361,100 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+    use crate::git::types::RestoreDiff;
+    use gix_hash::ObjectId;
+
+    fn oid(byte: u8) -> ObjectId {
+        let mut bytes = [0u8; 20];
+        bytes.fill(byte);
+        ObjectId::from_bytes_or_panic(&bytes)
+    }
+
+    #[test]
+    fn diff_empty_both() {
+        let got = compute_subtree_diff(&[], &[]);
+        assert_eq!(got, RestoreDiff { to_write: vec![], to_delete: vec![], unchanged: vec![] });
+    }
+
+    #[test]
+    fn diff_all_writes_when_head_empty() {
+        let source = vec![("a.md".to_string(), oid(0xAA))];
+        let got = compute_subtree_diff(&source, &[]);
+        assert_eq!(got.to_write, vec![("a.md".to_string(), oid(0xAA))]);
+        assert!(got.to_delete.is_empty());
+        assert!(got.unchanged.is_empty());
+    }
+
+    #[test]
+    fn diff_all_deletes_when_source_empty() {
+        let head = vec![("b.md".to_string(), oid(0xBB))];
+        let got = compute_subtree_diff(&[], &head);
+        assert!(got.to_write.is_empty());
+        assert_eq!(got.to_delete, vec!["b.md".to_string()]);
+        assert!(got.unchanged.is_empty());
+    }
+
+    #[test]
+    fn diff_unchanged_same_oid_same_path() {
+        let entries = vec![("a.md".to_string(), oid(0xCC))];
+        let got = compute_subtree_diff(&entries, &entries);
+        assert!(got.to_write.is_empty());
+        assert!(got.to_delete.is_empty());
+        assert_eq!(got.unchanged, vec!["a.md".to_string()]);
+    }
+
+    #[test]
+    fn diff_overwrite_when_same_path_different_oid() {
+        let source = vec![("a.md".to_string(), oid(0xAA))];
+        let head   = vec![("a.md".to_string(), oid(0xBB))];
+        let got = compute_subtree_diff(&source, &head);
+        assert_eq!(got.to_write, vec![("a.md".to_string(), oid(0xAA))]);
+        assert!(got.to_delete.is_empty());
+        assert!(got.unchanged.is_empty());
+    }
+
+    #[test]
+    fn diff_mixed_buckets_sorted_deterministically() {
+        let source = vec![
+            ("keep.md".to_string(), oid(0x11)),
+            ("change.md".to_string(), oid(0x22)),
+            ("new.md".to_string(), oid(0x33)),
+        ];
+        let head = vec![
+            ("keep.md".to_string(), oid(0x11)),
+            ("change.md".to_string(), oid(0x99)),
+            ("gone.md".to_string(), oid(0x44)),
+        ];
+        let got = compute_subtree_diff(&source, &head);
+        assert_eq!(
+            got.to_write,
+            vec![
+                ("change.md".to_string(), oid(0x22)),
+                ("new.md".to_string(), oid(0x33)),
+            ]
+        );
+        assert_eq!(got.to_delete, vec!["gone.md".to_string()]);
+        assert_eq!(got.unchanged, vec!["keep.md".to_string()]);
+    }
+
+    #[test]
+    fn diff_handles_nested_paths() {
+        let source = vec![
+            ("docs/a.md".to_string(), oid(0xAA)),
+            ("docs/sub/b.md".to_string(), oid(0xBB)),
+        ];
+        let head = vec![("docs/a.md".to_string(), oid(0xAA))];
+        let got = compute_subtree_diff(&source, &head);
+        assert_eq!(
+            got.to_write,
+            vec![("docs/sub/b.md".to_string(), oid(0xBB))]
+        );
+        assert!(got.to_delete.is_empty());
+        assert_eq!(got.unchanged, vec!["docs/a.md".to_string()]);
+    }
+}
+
