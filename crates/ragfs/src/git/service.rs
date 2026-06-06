@@ -15,7 +15,7 @@ use crate::git::{
     error::{GitError, RefStoreError},
     object_store::ObjectStore,
     ref_store::RefStore,
-    types::{CommitRequest, CommitResponse},
+    types::{CommitRequest, CommitResponse, ShowRequest, ShowResponse},
 };
 
 /// `GitService` orchestrates the full commit pipeline against a `FileSystem`
@@ -206,6 +206,66 @@ impl GitService {
             changed,
         })
     }
+
+    /// Read a commit's metadata, or a single blob's bytes from inside a commit's tree.
+    ///
+    /// `target_ref` resolution: 40-hex OID / "main" / "refs/heads/main".
+    ///
+    /// - `path = None`  → returns `ShowResponse::Commit { oid, tree, parents, author, committer, message }`.
+    /// - `path = Some(p)` → returns `ShowResponse::Blob { oid, size, bytes }` for the path inside
+    ///   the commit's tree. Missing path → `GitError::PathNotFound(p)`. Path that resolves to
+    ///   a tree (not a blob) → `GitError::PathNotFound(p)` (treat the same as missing — callers
+    ///   asked for blob bytes, not a directory listing).
+    ///
+    /// Missing ref → `GitError::RefStore(RefStoreError::NotFound)`.
+    /// Missing commit object → `GitError::ObjectStore(ObjectStoreError::NotFound)`.
+    pub async fn show(&self, req: ShowRequest) -> Result<ShowResponse, GitError> {
+        let ShowRequest { account, target_ref, path } = req;
+
+        let commit_oid = resolve_ref(self.ref_store.as_ref(), &account, &target_ref).await?;
+        let meta = load_commit_meta(self.object_store.as_ref(), &account, &commit_oid).await?;
+
+        match path {
+            None => Ok(ShowResponse::Commit {
+                oid: commit_oid,
+                tree: meta.tree,
+                parents: meta.parents,
+                author: meta.author,
+                committer: meta.committer,
+                message: meta.message,
+            }),
+            Some(p) => {
+                let entry = crate::git::tree_builder::lookup(
+                    self.object_store.as_ref(),
+                    &account,
+                    meta.tree,
+                    &p,
+                ).await?;
+                let (blob_oid, mode) = entry.ok_or_else(|| GitError::PathNotFound(p.clone()))?;
+                // Reject trees masquerading as paths: callers asked for blob bytes.
+                if mode.is_tree() {
+                    return Err(GitError::PathNotFound(p));
+                }
+                let raw = crate::git::util::read_object(
+                    self.object_store.as_ref(),
+                    &account,
+                    &blob_oid,
+                ).await?;
+                let (kind, payload_size, hdr) = crate::git::util::parse_object_header(&raw)?;
+                if kind != gix_object::Kind::Blob {
+                    return Err(GitError::CorruptedObject(format!(
+                        "expected blob at {p}, got {kind:?}"
+                    )));
+                }
+                let bytes = raw[hdr..].to_vec();
+                Ok(ShowResponse::Blob {
+                    oid: blob_oid,
+                    size: payload_size,
+                    bytes,
+                })
+            }
+        }
+    }
 }
 
 /// Resolve `target_ref` to a commit OID.
@@ -219,7 +279,6 @@ impl GitService {
 ///
 /// Returns `RefStoreError::NotFound` (wrapped) if the ref doesn't exist;
 /// `GitError::Other` if `target_ref` is neither a valid OID nor a valid ref name.
-#[allow(dead_code)] // wired up by GitService::show in Task 3
 async fn resolve_ref(
     ref_store: &dyn RefStore,
     account: &str,
@@ -245,13 +304,9 @@ async fn resolve_ref(
 /// (full set). Owned so callers don't have to juggle the raw buffer.
 struct CommitMeta {
     tree: ObjectId,
-    #[allow(dead_code)] // consumed by GitService::show in Task 3
     parents: Vec<ObjectId>,
-    #[allow(dead_code)]
     author: crate::git::types::Actor,
-    #[allow(dead_code)]
     committer: crate::git::types::Actor,
-    #[allow(dead_code)]
     message: String,
 }
 
@@ -498,6 +553,19 @@ mod tests {
             .await
             .unwrap()
             .tree
+    }
+
+    /// Make a commit and return its OID.
+    async fn make_commit(
+        svc: &GitService,
+        account: &str,
+        branch: &str,
+        msg: &str,
+    ) -> ObjectId {
+        match svc.commit(req(account, branch, msg, None)).await.unwrap() {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        }
     }
 
     // ── 1 ──────────────────────────────────────────────────────────────
@@ -796,5 +864,171 @@ mod tests {
         .unwrap();
         let paths: Vec<String> = all.into_iter().map(|(p, _)| p).collect();
         assert_eq!(paths, vec!["resources/a.md".to_string()]);
+    }
+
+    // ── 9: show ────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_show_commit_meta_by_oid() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"hello");
+        let oid = make_commit(&svc, "acct", "main", "first").await;
+
+        let resp = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: oid.to_hex().to_string(),
+                path: None,
+            })
+            .await
+            .unwrap();
+
+        match resp {
+            ShowResponse::Commit {
+                oid: returned,
+                parents,
+                message,
+                author,
+                committer,
+                tree,
+            } => {
+                assert_eq!(returned, oid);
+                assert!(parents.is_empty(), "root commit");
+                assert_eq!(message, "first");
+                assert_eq!(author.name, "tester");
+                assert_eq!(author.email, "tester@example.com");
+                assert_eq!(committer.name, "tester");
+                assert_ne!(tree, ObjectId::empty_tree(gix_hash::Kind::Sha1));
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    // ── 10 ─────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_show_resolves_branch_name_and_full_ref() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"hello");
+        let oid = make_commit(&svc, "acct", "main", "first").await;
+
+        for tref in ["main", "refs/heads/main"] {
+            let resp = svc
+                .show(ShowRequest {
+                    account: "acct".into(),
+                    target_ref: tref.into(),
+                    path: None,
+                })
+                .await
+                .unwrap();
+            match resp {
+                ShowResponse::Commit { oid: returned, .. } => assert_eq!(returned, oid),
+                other => panic!("{tref}: expected Commit, got {other:?}"),
+            }
+        }
+    }
+
+    // ── 11 ─────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_show_blob_round_trip() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        let body = b"hello world\n";
+        vfs.put("resources/a.md", body);
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        let resp = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("resources/a.md".into()),
+            })
+            .await
+            .unwrap();
+
+        match resp {
+            ShowResponse::Blob { bytes, size, oid: _ } => {
+                assert_eq!(bytes, body.to_vec());
+                assert_eq!(size, body.len() as u64);
+            }
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    // ── 12 ─────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_show_blob_path_not_found() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"x");
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("resources/missing.md".into()),
+            })
+            .await
+            .unwrap_err();
+
+        match err {
+            GitError::PathNotFound(p) => assert_eq!(p, "resources/missing.md"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+    }
+
+    // ── 13 ─────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_show_blob_rejects_directory_path() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"x");
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("resources".into()),
+            })
+            .await
+            .unwrap_err();
+
+        match err {
+            GitError::PathNotFound(p) => assert_eq!(p, "resources"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+    }
+
+    // ── 14 ─────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_show_unknown_ref() {
+        let (_dir, _vfs, _object_store, _ref_store, svc) = make_service("acct");
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "nonexistent".into(),
+                path: None,
+            })
+            .await
+            .unwrap_err();
+
+        match err {
+            GitError::RefStore(RefStoreError::NotFound(name)) => {
+                assert_eq!(name, "refs/heads/nonexistent");
+            }
+            other => panic!("expected RefStore NotFound, got {other:?}"),
+        }
+    }
+
+    // ── 15 ─────────────────────────────────────────────────────────────
+    #[tokio::test]
+    async fn test_show_malformed_oid_input() {
+        let (_dir, _vfs, _object_store, _ref_store, svc) = make_service("acct");
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "z".repeat(40),
+                path: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GitError::Other(_) | GitError::RefStore(_)));
     }
 }
