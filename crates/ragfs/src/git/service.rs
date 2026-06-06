@@ -2105,6 +2105,78 @@ mod tests {
             "new_skill.py must still be present in the new tree",
         );
     }
+
+    #[tokio::test]
+    async fn test_restore_then_show_reflects_old_content() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+
+        vfs.put("resources/proj_a/note.md", b"original");
+        let src = make_commit(&svc, "acct", "main", "src").await;
+
+        vfs.put("resources/proj_a/note.md", b"edited");
+        let _ = make_commit(&svc, "acct", "main", "edit").await;
+
+        // Sanity: show on HEAD shows "edited".
+        let head_show = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("resources/proj_a/note.md".into()),
+            })
+            .await
+            .unwrap();
+        match head_show {
+            ShowResponse::Blob { bytes, .. } => assert_eq!(bytes.as_ref(), b"edited"),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+
+        // Restore.
+        let new_oid = match svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: src.to_hex().to_string(),
+                dry_run: false,
+                message: Some("rewind".into()),
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap()
+        {
+            RestoreResponse::Applied { new_commit_oid, .. } => new_commit_oid,
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+        // After restore: show on main should reflect the original content.
+        let after_show = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("resources/proj_a/note.md".into()),
+            })
+            .await
+            .unwrap();
+        match after_show {
+            ShowResponse::Blob { bytes, .. } => assert_eq!(bytes.as_ref(), b"original"),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+
+        // And show on the new oid by hex resolves to the same content.
+        let by_oid = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: new_oid.to_hex().to_string(),
+                path: Some("resources/proj_a/note.md".into()),
+            })
+            .await
+            .unwrap();
+        match by_oid {
+            ShowResponse::Blob { bytes, .. } => assert_eq!(bytes.as_ref(), b"original"),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
