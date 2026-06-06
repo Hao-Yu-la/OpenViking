@@ -279,12 +279,16 @@ impl GitService {
 ///
 /// Returns `RefStoreError::NotFound` (wrapped) if the ref doesn't exist;
 /// `GitError::Other` if `target_ref` is neither a valid OID nor a valid ref name.
+///
+/// Note: a 40-char hex string is always interpreted as an OID, even if it
+/// happens to also be a valid branch name (e.g. `deadbeefdeadbeef...`).
+/// To disambiguate such a branch, pass the full ref path `refs/heads/<name>`.
 async fn resolve_ref(
     ref_store: &dyn RefStore,
     account: &str,
     target_ref: &str,
 ) -> Result<ObjectId, GitError> {
-    // 1. 40-hex commit OID — accept only lowercase hex of exactly len 40.
+    // 1. 40-hex commit OID — ASCII hex (case-insensitive), exactly len 40.
     if target_ref.len() == 40 && target_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
         return ObjectId::from_hex(target_ref.as_bytes())
             .map_err(|e| GitError::Other(format!("invalid oid {target_ref}: {e}")));
@@ -339,6 +343,7 @@ async fn load_commit_meta(
 /// gix-actor 0.31.5 fields used: `SignatureRef.name: &BStr`, `.email: &BStr`,
 /// `.time: gix_date::Time` (not the raw `&str` of later versions). `Time`
 /// provides `.seconds: i64` and `.offset: i32`.
+// TODO: gix_date::Time.sign dropped — Actor not roundtrip-safe for "-0000"
 fn actor_from_signature_ref(sig: &gix_actor::SignatureRef<'_>) -> crate::git::types::Actor {
     crate::git::types::Actor {
         name: sig.name.to_string(),
@@ -365,6 +370,7 @@ mod tests {
     use crate::core::types::{FileInfo, TreeEntry, WriteFlag};
     use crate::git::backends::local::{LocalObjectStore, LocalRefStore};
     use crate::git::error::RefStoreError;
+    use crate::git::error::ObjectStoreError;
     use crate::git::tree_builder::{flatten, lookup};
 
     /// In-memory VFS mock that owns a map from absolute path to bytes.
@@ -1095,5 +1101,226 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, GitError::Other(_) | GitError::RefStore(_)));
+    }
+
+    // ── 16 ─────────────────────────────────────────────────────────────
+    /// Blob bytes survive a round-trip even when they contain NUL bytes,
+    /// non-UTF-8 sequences, and multiple newlines. Guards against any
+    /// future "treat blobs as strings" regression.
+    #[tokio::test]
+    async fn test_show_blob_binary_and_multiline() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        // NUL, invalid UTF-8 (0xC3 0x28 is an invalid 2-byte sequence), CRLF, LF.
+        let body: Vec<u8> = vec![
+            b'h', b'i', 0x00, 0xC3, 0x28, b'\r', b'\n', b'l', b'i', b'n', b'e', b'2', b'\n',
+            0xFF, 0xFE, 0xFD,
+        ];
+        vfs.put("resources/bin.dat", &body);
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        let resp = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("resources/bin.dat".into()),
+            })
+            .await
+            .unwrap();
+
+        match resp {
+            ShowResponse::Blob { bytes, size, .. } => {
+                assert_eq!(bytes, body);
+                assert_eq!(size as usize, body.len());
+            }
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    // ── 17 ─────────────────────────────────────────────────────────────
+    /// Construct a commit whose author and committer differ, write it
+    /// directly via `util::write_object`, point a ref at it, and verify
+    /// `show()` decodes the two signatures into the two Actor fields
+    /// without crossing them. Bypasses `commit()` because the public
+    /// `CommitRequest` API only accepts one author (used for both).
+    #[tokio::test]
+    async fn test_show_distinguishes_committer_from_author() {
+        use gix_object::{bstr::BString, Commit, WriteTo};
+
+        let (_dir, vfs, object_store, ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"x");
+        // First, create a normal commit just to get a real tree OID.
+        let seed_oid = make_commit(&svc, "acct", "main", "seed").await;
+        let seed_tree = load_commit_meta(object_store.as_ref() as &dyn ObjectStore, "acct", &seed_oid)
+            .await
+            .unwrap()
+            .tree;
+
+        // Build a commit with deliberately mismatched author/committer.
+        let author = gix_actor::Signature {
+            name: "Alice Author".into(),
+            email: "alice@example.com".into(),
+            time: gix_date::Time {
+                seconds: 1_700_000_000,
+                offset: 3600,
+                sign: gix_date::time::Sign::Plus,
+            },
+        };
+        let committer = gix_actor::Signature {
+            name: "Carol Committer".into(),
+            email: "carol@example.com".into(),
+            time: gix_date::Time {
+                seconds: 1_700_000_100,
+                offset: -7200,
+                sign: gix_date::time::Sign::Minus,
+            },
+        };
+        let commit = Commit {
+            tree: seed_tree,
+            parents: Vec::new().into(),
+            author,
+            committer,
+            encoding: None,
+            message: BString::from("split-actors"),
+            extra_headers: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        commit.write_to(&mut buf).unwrap();
+        let oid = crate::git::util::write_object(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            gix_object::Kind::Commit,
+            &buf,
+        )
+        .await
+        .unwrap();
+
+        // Point a fresh branch at it so show() can find it by name.
+        ref_store
+            .cas_update("acct", "refs/heads/split", None, oid)
+            .await
+            .unwrap();
+
+        let resp = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "split".into(),
+                path: None,
+            })
+            .await
+            .unwrap();
+
+        match resp {
+            ShowResponse::Commit { author, committer, .. } => {
+                assert_eq!(author.name, "Alice Author");
+                assert_eq!(author.email, "alice@example.com");
+                assert_eq!(author.time_seconds, 1_700_000_000);
+                assert_eq!(author.tz_offset_seconds, 3600);
+                assert_eq!(committer.name, "Carol Committer");
+                assert_eq!(committer.email, "carol@example.com");
+                assert_eq!(committer.time_seconds, 1_700_000_100);
+                assert_eq!(committer.tz_offset_seconds, -7200);
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    // ── 18 ─────────────────────────────────────────────────────────────
+    /// When an intermediate path component is a blob (not a tree),
+    /// `tree_builder::lookup` returns `Ok(None)`, which `show()` maps
+    /// to `PathNotFound`. Pin this so a future change can't silently
+    /// reinterpret it as `PathIsDirectory` or `CorruptedObject`.
+    #[tokio::test]
+    async fn test_show_intermediate_path_component_is_blob() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"x");
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("resources/a.md/oops".into()),
+            })
+            .await
+            .unwrap_err();
+
+        match err {
+            GitError::PathNotFound(p) => assert_eq!(p, "resources/a.md/oops"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+    }
+
+    // ── 19 ─────────────────────────────────────────────────────────────
+    /// Pin the current per-shape behavior for malformed paths so any
+    /// future input normalization change is explicit:
+    ///   - `""`     → `Other` (empty path rejected by `lookup` up-front)
+    ///   - `"/x"`   → `Other` (first component is empty)
+    ///   - `"x/"`   → `PathNotFound` (lookup fails on missing "x" before
+    ///                ever inspecting the trailing empty component)
+    ///   - `"a//b"` → `PathNotFound` (lookup fails on missing "a" before
+    ///                ever inspecting the empty middle component)
+    #[tokio::test]
+    async fn test_show_path_with_invalid_form() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"x");
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        let cases: &[(&str, fn(&GitError) -> bool)] = &[
+            ("", |e| matches!(e, GitError::Other(_))),
+            ("/x", |e| matches!(e, GitError::Other(_))),
+            ("x/", |e| matches!(e, GitError::PathNotFound(p) if p == "x/")),
+            ("a//b", |e| matches!(e, GitError::PathNotFound(p) if p == "a//b")),
+        ];
+
+        for (bad, check) in cases {
+            let err = svc
+                .show(ShowRequest {
+                    account: "acct".into(),
+                    target_ref: "main".into(),
+                    path: Some((*bad).into()),
+                })
+                .await
+                .unwrap_err();
+            assert!(check(&err), "path {bad:?}: unexpected error variant {err:?}");
+        }
+    }
+
+    // ── 20 ─────────────────────────────────────────────────────────────
+    /// If the commit's loose object file is removed from the store
+    /// after the ref still points at it, `show()` must surface
+    /// `ObjectStoreError::NotFound` (wrapped in `GitError::ObjectStore`).
+    /// Guards against any future "swallow missing objects" regression
+    /// inside `load_commit_meta`.
+    #[tokio::test]
+    async fn test_show_commit_object_missing_from_store() {
+        let (dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"x");
+        let oid = make_commit(&svc, "acct", "main", "first").await;
+
+        // LocalObjectStore layout: {base_dir}/{account}/objects/{aa}/{bb...}
+        let hex = oid.to_hex().to_string();
+        let path = dir
+            .path()
+            .join("acct")
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        std::fs::remove_file(&path).expect("loose commit object must exist before removal");
+
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: None,
+            })
+            .await
+            .unwrap_err();
+
+        match err {
+            GitError::ObjectStore(ObjectStoreError::NotFound(missing)) => {
+                assert_eq!(missing, oid);
+            }
+            other => panic!("expected ObjectStore(NotFound), got {other:?}"),
+        }
     }
 }
