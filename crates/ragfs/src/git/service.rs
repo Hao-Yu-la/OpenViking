@@ -1847,6 +1847,99 @@ mod tests {
             only_oid
         );
     }
+
+    #[tokio::test]
+    async fn test_restore_invalid_project_dir() {
+        let (_dir, _vfs, _object_store, _ref_store, svc) = make_service("acct");
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "".into(), // empty
+                source_commit: "main".into(),
+                dry_run: true,
+                message: None,
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GitError::InvalidProjectDir(_)));
+    }
+
+    #[tokio::test]
+    async fn test_restore_unknown_source_ref() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/proj_a/a.md", b"x");
+        let _ = make_commit(&svc, "acct", "main", "init").await;
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: "does-not-exist".into(),
+                dry_run: true,
+                message: None,
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GitError::RefStore(RefStoreError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_restore_unknown_branch_head() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/proj_a/a.md", b"x");
+        let only = make_commit(&svc, "acct", "main", "only").await;
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "ghost".into(), // doesn't exist
+                project_dir: "resources/proj_a".into(),
+                source_commit: only.to_hex().to_string(),
+                dry_run: true,
+                message: None,
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GitError::RefStore(RefStoreError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_restore_project_dir_missing_in_source_commit() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        // Source commit only has resources/other_proj.
+        vfs.put("resources/other_proj/x.md", b"x");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+        // HEAD has the project we will try to restore.
+        vfs.put("resources/proj_a/a.md", b"a");
+        let _ = make_commit(&svc, "acct", "main", "head").await;
+
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: true,
+                message: None,
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap_err();
+        match err {
+            GitError::SubtreeNotFoundInCommit { project_dir, commit } => {
+                assert_eq!(project_dir, "resources/proj_a");
+                assert_eq!(commit, source_oid);
+            }
+            other => panic!("expected SubtreeNotFoundInCommit, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
