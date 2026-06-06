@@ -75,3 +75,85 @@ pub struct Actor {
     /// Timezone offset in seconds (e.g. +08:00 → 28800).
     pub tz_offset_seconds: i32,
 }
+
+/// Input for `GitService::restore`.
+#[derive(Debug, Clone)]
+pub struct RestoreRequest {
+    /// Account this restore applies to.
+    pub account: String,
+    /// Branch whose HEAD is the parent of the new commit. Defaults to "main"
+    /// in callers; this DTO requires the caller to pass it explicitly to
+    /// avoid invisible defaults at this layer.
+    pub branch: String,
+    /// Account-relative subtree path to restore, e.g. "resources/proj_a".
+    /// Empty or malformed strings are rejected with `GitError::InvalidProjectDir`.
+    pub project_dir: String,
+    /// What to restore from. Same resolution rules as `ShowRequest::target_ref`:
+    /// 40-hex commit OID / short branch name / full `refs/heads/xxx`.
+    pub source_commit: String,
+    /// If `true`, compute and return the diff but write nothing — no VFS
+    /// writes, no new objects in the object store, no ref update.
+    pub dry_run: bool,
+    /// Commit message for the new commit. If `None`, a default is generated:
+    /// `"restore {project_dir} from {source_oid_short}"`.
+    pub message: Option<String>,
+    pub author_name: String,
+    pub author_email: String,
+}
+
+/// Structured diff between two subtrees, computed by `restore`.
+///
+/// All paths in this struct are **relative to `project_dir`** — they are NOT
+/// prefixed. Callers (e.g. a future Python wrapper) prefix them when needed
+/// for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreDiff {
+    /// Paths whose content in `source_subtree` should be written into the VFS
+    /// (creates or overwrites). Carries the blob oid to fetch from the
+    /// object store.
+    pub to_write: Vec<(String, ObjectId)>,
+    /// Paths present in `head_subtree` but absent in `source_subtree`. Must
+    /// be removed from the VFS.
+    pub to_delete: Vec<String>,
+    /// Paths whose oid is identical in both subtrees. Listed only for
+    /// reporting; restore does not touch them.
+    pub unchanged: Vec<String>,
+}
+
+/// Output of `GitService::restore`.
+#[derive(Debug, Clone)]
+pub enum RestoreResponse {
+    /// A new commit was created and the branch ref now points at it.
+    Applied {
+        /// The new commit's OID — branch HEAD now points here.
+        new_commit_oid: ObjectId,
+        /// The source commit (after `resolve_ref`) we restored from.
+        source_commit: ObjectId,
+        /// Previous HEAD oid (parent of `new_commit_oid`).
+        parent_commit: ObjectId,
+        /// Number of files written through the VFS.
+        written: usize,
+        /// Number of files deleted through the VFS.
+        deleted: usize,
+        /// Number of files left untouched because source/head agreed.
+        unchanged: usize,
+    },
+    /// Source subtree byte-equal to head subtree — nothing to do. No new
+    /// commit was created; the branch ref is unchanged.
+    Noop {
+        /// Current HEAD oid (unchanged).
+        head: ObjectId,
+        /// Source commit oid (after `resolve_ref`).
+        source: ObjectId,
+    },
+    /// `dry_run = true` request — returns the computed diff without
+    /// performing any writes.
+    DryRun {
+        /// The computed diff (paths are relative to `project_dir`).
+        diff: RestoreDiff,
+        /// Current HEAD oid (would-be parent if applied).
+        head: ObjectId,
+        /// Source commit oid (after `resolve_ref`).
+        source: ObjectId,
+    },
+}

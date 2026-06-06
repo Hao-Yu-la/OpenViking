@@ -42,7 +42,10 @@ pub use object_store::ObjectStore;
 pub use ref_store::RefStore;
 pub use service::GitService;
 pub use tree_builder::{flatten, lookup, TreeEditor};
-pub use types::{Actor, CommitRequest, CommitResponse, IndexEntry, ShowRequest, ShowResponse};
+pub use types::{
+    Actor, CommitRequest, CommitResponse, IndexEntry, RestoreDiff, RestoreRequest,
+    RestoreResponse, ShowRequest, ShowResponse,
+};
 
 // Re-exports from backends
 pub use backends::local::{LocalObjectStore, LocalRefStore};

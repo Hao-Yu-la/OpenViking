@@ -77,6 +77,21 @@ pub enum GitError {
     #[error("path is a directory, not a file: {0}")]
     PathIsDirectory(String),
 
+    /// `project_dir` is an empty / malformed path string.
+    /// Same validation as `TreeEditor::upsert`: must be non-empty, no leading
+    /// or trailing `/`, no empty components.
+    #[error("invalid project_dir: {0}")]
+    InvalidProjectDir(String),
+
+    /// The requested `project_dir` does not resolve to a subtree in the
+    /// referenced commit's tree (either the path is missing entirely or it
+    /// resolves to a blob rather than a tree).
+    #[error("project_dir {project_dir:?} not found as a subtree in commit {commit}")]
+    SubtreeNotFoundInCommit {
+        project_dir: String,
+        commit: gix_hash::ObjectId,
+    },
+
     /// Invalid account ID
     #[error("invalid account id: {0}")]
     InvalidAccountId(String),
