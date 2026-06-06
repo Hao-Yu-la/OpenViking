@@ -1940,6 +1940,61 @@ mod tests {
             other => panic!("expected SubtreeNotFoundInCommit, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn test_restore_cas_conflict_surfaces_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(dir.path()));
+        let inner_ref = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = MockVfs::new("acct");
+
+        // Build a real first commit through a plain service so we have a HEAD.
+        let bootstrap_svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            inner_ref.clone() as Arc<dyn RefStore>,
+        );
+        vfs.put("resources/proj_a/a.md", b"v1");
+        let source_oid = make_commit(&bootstrap_svc, "acct", "main", "source").await;
+        vfs.put("resources/proj_a/a.md", b"v2");
+        let head_oid = make_commit(&bootstrap_svc, "acct", "main", "head").await;
+
+        // Now wrap the ref store to force the first cas_update to fail.
+        let bogus =
+            ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+        let conflict_ref = Arc::new(ConflictOnceRef {
+            inner: inner_ref.clone(),
+            fired: Mutex::new(false),
+            actual: Some(bogus),
+        });
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            conflict_ref as Arc<dyn RefStore>,
+        );
+
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: None,
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap_err();
+        match err {
+            GitError::ConcurrentCommit { ref_name, expected, actual } => {
+                assert_eq!(ref_name, "refs/heads/main");
+                assert_eq!(expected, Some(head_oid));
+                assert_eq!(actual, Some(bogus));
+            }
+            other => panic!("expected ConcurrentCommit, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
