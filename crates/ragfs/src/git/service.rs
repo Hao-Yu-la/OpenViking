@@ -832,6 +832,71 @@ mod tests {
     }
 
     // ── 7 ──────────────────────────────────────────────────────────────
+    // Verifies the incremental commit path reuses unchanged subtree OIDs:
+    // modifying a file under `resources/` must NOT rewrite the `agent/`
+    // subtree object — its OID must be byte-identical across commits.
+    #[tokio::test]
+    async fn test_commit_incremental_reuses_unchanged_subtree_oids() {
+        let (_dir, vfs, object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"hello");
+        vfs.put("agent/b.py", b"print('hi')");
+
+        let first = svc.commit(req("acct", "main", "first", None)).await.unwrap();
+        let first_oid = match first {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let first_tree = commit_tree(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            first_oid,
+        )
+        .await;
+        let agent_first = lookup(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            first_tree,
+            "agent",
+        )
+        .await
+        .unwrap()
+        .expect("agent subtree must exist after first commit");
+        assert!(agent_first.1.is_tree(), "agent entry must be a tree");
+
+        // Touch only resources/a.md.
+        vfs.put("resources/a.md", b"world");
+        let second = svc.commit(req("acct", "main", "second", None)).await.unwrap();
+        let second_oid = match second {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let second_tree = commit_tree(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            second_oid,
+        )
+        .await;
+        assert_ne!(
+            first_tree, second_tree,
+            "root tree must change because resources/a.md changed",
+        );
+        let agent_second = lookup(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            second_tree,
+            "agent",
+        )
+        .await
+        .unwrap()
+        .expect("agent subtree must still exist after second commit");
+
+        assert_eq!(
+            agent_first.0, agent_second.0,
+            "unchanged agent/ subtree OID must be reused across commits",
+        );
+    }
+
+    // ── 8 ──────────────────────────────────────────────────────────────
     #[tokio::test]
     async fn test_commit_skips_pruned_paths() {
         let (_dir, vfs, object_store, _ref_store, svc) = make_service("acct");
