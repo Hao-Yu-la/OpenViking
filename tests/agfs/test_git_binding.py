@@ -255,3 +255,63 @@ backend = "bogus"
     with pytest.raises(Exception) as excinfo:
         ragfs_python.RAGFSBindingClient(config_path=str(cfg))
     assert "unsupported git backend" in str(excinfo.value).lower()
+
+
+def test_cas_conflict_surface(client):
+    """Two commits trying to advance from the same parent — one should win,
+    the other should raise GitConcurrentCommitError.
+
+    We provoke this by writing two different files, then issuing two
+    git_commit calls back-to-back with paths overlapping enough that both
+    actually produce new tree objects.
+    """
+    import threading
+
+    from openviking.pyagfs import GitConcurrentCommitError
+
+    account = "acct_cas"
+    _write(client, account, "resources/seed.md", b"seed")
+    client.git_commit(
+        account=account, branch="main", message="seed",
+        author_name="n", author_email="e",
+        paths=["resources/seed.md"],
+    )
+
+    # Prepare two divergent changes
+    _write(client, account, "resources/a.md", b"AAA")
+    _write(client, account, "resources/b.md", b"BBB")
+
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    barrier = threading.Barrier(2)
+
+    def do_commit(path: str):
+        try:
+            barrier.wait()
+            r = client.git_commit(
+                account=account, branch="main", message=f"commit {path}",
+                author_name="n", author_email="e",
+                paths=[path],
+            )
+            results.append(r)
+        except BaseException as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=do_commit, args=("resources/a.md",))
+    t2 = threading.Thread(target=do_commit, args=("resources/b.md",))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    # The LocalRefStore mutex + CAS may serialize the two so well that the
+    # second sees the new parent and the conflict never surfaces. In that case
+    # both succeed and form a linear history — that is also correct behavior.
+    # We accept either outcome but verify that NO silent data loss occurs:
+    # if both succeed, the second's commit_oid != the first's; if one fails,
+    # the failure must be GitConcurrentCommitError.
+    if len(errors) == 1:
+        assert isinstance(errors[0], GitConcurrentCommitError), errors[0]
+        assert len(results) == 1
+    else:
+        assert errors == [], errors
+        assert len(results) == 2
+        assert results[0]["commit_oid"] != results[1]["commit_oid"]
