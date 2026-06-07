@@ -28,6 +28,7 @@
 
 pub mod backends;
 pub mod commit;
+pub mod config;
 pub mod enumerate;
 pub mod error;
 pub mod object_store;
@@ -37,6 +38,7 @@ pub mod tree_builder;
 pub mod types;
 pub mod util;
 
+pub use config::{GitConfig, GitLocalConfig, GitS3ConfigPy, GitTuningConfig};
 pub use error::{GitError, ObjectStoreError, RefStoreError};
 pub use object_store::ObjectStore;
 pub use ref_store::RefStore;

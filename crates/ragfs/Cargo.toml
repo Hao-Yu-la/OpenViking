@@ -90,6 +90,7 @@ grep-searcher = "0.1.16"
 tempfile = "3.12"
 criterion = "0.5"
 tokio = { version = "1.38", features = ["full"] }
+toml = "0.8"
 
 [features]
 default = []
