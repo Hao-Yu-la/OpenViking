@@ -107,14 +107,12 @@ def test_commit_then_show_roundtrip(client):
     _write(client, account, "resources/a.md", b"hello world")
 
     resp = client.git_commit(
-        {
-            "account": account,
-            "branch": "main",
-            "message": "initial",
-            "author_name": "alice",
-            "author_email": "a@e.com",
-            "paths": ["resources/a.md"],
-        }
+        account=account,
+        branch="main",
+        message="initial",
+        author_name="alice",
+        author_email="a@e.com",
+        paths=["resources/a.md"],
     )
     assert resp["result"] == "created"
     assert resp["changed"] == 1
@@ -122,11 +120,9 @@ def test_commit_then_show_roundtrip(client):
     assert len(commit_oid) == 40
 
     shown = client.git_show(
-        {
-            "account": account,
-            "target_ref": "main",
-            "path": "resources/a.md",
-        }
+        account=account,
+        target_ref="main",
+        path="resources/a.md",
     )
     assert shown["bytes"] == b"hello world"
     assert shown["size"] == 11
@@ -136,16 +132,14 @@ def test_commit_then_show_commit_metadata(client):
     account = "acct1"
     _write(client, account, "resources/a.md", b"x")
     resp = client.git_commit(
-        {
-            "account": account,
-            "branch": "main",
-            "message": "m1",
-            "author_name": "alice",
-            "author_email": "a@e.com",
-            "paths": ["resources/a.md"],
-        }
+        account=account,
+        branch="main",
+        message="m1",
+        author_name="alice",
+        author_email="a@e.com",
+        paths=["resources/a.md"],
     )
-    meta = client.git_show({"account": account, "target_ref": "main"})
+    meta = client.git_show(account=account, target_ref="main")
     assert meta["message"].startswith("m1")
     assert meta["oid"] == resp["commit_oid"]
     assert meta["parents"] == []
