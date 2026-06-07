@@ -144,3 +144,114 @@ def test_commit_then_show_commit_metadata(client):
     assert meta["oid"] == resp["commit_oid"]
     assert meta["parents"] == []
     assert meta["author"]["name"] == "alice"
+
+
+def test_restore_roundtrip(client):
+    """Commit v1 → modify → commit v2 → restore v1 → file reverts; HEAD moves to v3."""
+    account = "acct1"
+    _write(client, account, "resources/proj/a.md", b"v1-content")
+
+    v1 = client.git_commit(
+        account=account, branch="main", message="v1",
+        author_name="a", author_email="a@e",
+        paths=["resources/proj/a.md"],
+    )
+    v1_oid = v1["commit_oid"]
+
+    _write(client, account, "resources/proj/a.md", b"v2-content")
+    v2 = client.git_commit(
+        account=account, branch="main", message="v2",
+        author_name="a", author_email="a@e",
+        paths=["resources/proj/a.md"],
+    )
+    v2_oid = v2["commit_oid"]
+
+    restored = client.git_restore(
+        account=account, branch="main",
+        project_dir="resources/proj",
+        source_commit=v1_oid,
+        author_name="a", author_email="a@e",
+    )
+    assert restored["result"] == "applied"
+    assert restored["source_commit"] == v1_oid
+    assert restored["parent_commit"] == v2_oid
+    assert restored["new_commit_oid"] != v2_oid
+    assert restored["written"] >= 1
+
+    # VFS file content reverted
+    content = client.read(f"/local/{account}/resources/proj/a.md")
+    assert content == b"v1-content"
+
+    # Branch now points at the new commit
+    head = client.git_show(account=account, target_ref="main")
+    assert head["oid"] == restored["new_commit_oid"]
+    assert head["parents"] == [v2_oid]
+
+
+def test_restore_dry_run_does_not_mutate(client):
+    account = "acct1"
+    _write(client, account, "resources/proj/a.md", b"v1")
+    v1 = client.git_commit(
+        account=account, branch="main", message="v1",
+        author_name="a", author_email="a@e",
+        paths=["resources/proj/a.md"],
+    )
+
+    _write(client, account, "resources/proj/a.md", b"v2")
+    client.git_commit(
+        account=account, branch="main", message="v2",
+        author_name="a", author_email="a@e",
+        paths=["resources/proj/a.md"],
+    )
+
+    res = client.git_restore(
+        account=account, branch="main",
+        project_dir="resources/proj",
+        source_commit=v1["commit_oid"],
+        author_name="a", author_email="a@e",
+        dry_run=True,
+    )
+    assert res["result"] == "dry_run"
+    assert "diff" in res
+    assert any(item["path"] == "a.md" for item in res["diff"]["to_write"])
+
+    # VFS still holds v2 — dry_run did not write
+    assert client.read(f"/local/{account}/resources/proj/a.md") == b"v2"
+
+
+def test_account_isolation(client):
+    """A commit under account A is invisible to account B."""
+    _write(client, "acct_a", "resources/a.md", b"x")
+    client.git_commit(
+        account="acct_a", branch="main", message="m",
+        author_name="n", author_email="e",
+        paths=["resources/a.md"],
+    )
+
+    from openviking.pyagfs import AGFSNotFoundError
+    with pytest.raises(AGFSNotFoundError):
+        client.git_show(account="acct_b", target_ref="main")
+
+
+def test_feature_disabled_raises(git_disabled_workspace):
+    from openviking.pyagfs import AGFSNotSupportedError
+    c = ragfs_python.RAGFSBindingClient(config_path=str(git_disabled_workspace))
+    with pytest.raises(AGFSNotSupportedError):
+        c.git_commit(
+            account="a", branch="main", message="m",
+            author_name="n", author_email="e",
+        )
+
+
+def test_invalid_backend_at_construct_time(tmp_path):
+    cfg = tmp_path / "bad.toml"
+    cfg.write_text(
+        """
+[git]
+enabled = true
+backend = "bogus"
+"""
+    )
+    with pytest.raises(Exception) as excinfo:
+        ragfs_python.RAGFSBindingClient(config_path=str(cfg))
+    assert "unsupported git backend" in str(excinfo.value).lower()

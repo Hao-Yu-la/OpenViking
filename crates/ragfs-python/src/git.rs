@@ -151,7 +151,7 @@ fn build_s3_service(
 /// module is not importable (e.g. during unit tests), falls back to
 /// `PyRuntimeError` with the same message.
 pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
-    use ragfs::git::GitError;
+    use ragfs::git::{GitError, ObjectStoreError, RefStoreError};
     let msg = e.to_string();
     match e {
         GitError::FeatureDisabled => new_py_err_pub(py, "AGFSNotSupportedError", msg),
@@ -164,6 +164,15 @@ pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
         GitError::BlobTooLarge { .. } => new_py_err_pub(py, "AGFSInvalidOperationError", msg),
         GitError::TooManyFiles { .. } => new_py_err_pub(py, "AGFSInvalidOperationError", msg),
         GitError::CorruptedObject(_) => new_py_err_pub(py, "AGFSInternalError", msg),
+        GitError::RefStore(RefStoreError::NotFound(_)) => {
+            new_py_err_pub(py, "AGFSNotFoundError", msg)
+        }
+        GitError::RefStore(RefStoreError::Conflict { .. }) => {
+            new_py_err_pub(py, "GitConcurrentCommitError", msg)
+        }
+        GitError::ObjectStore(ObjectStoreError::NotFound(_)) => {
+            new_py_err_pub(py, "AGFSNotFoundError", msg)
+        }
         GitError::ObjectStore(_) | GitError::RefStore(_) | GitError::Vfs(_) | GitError::Other(_) => {
             PyRuntimeError::new_err(msg)
         }
