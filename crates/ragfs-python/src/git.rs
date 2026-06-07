@@ -145,11 +145,50 @@ fn build_s3_service(
     Ok((object_store, ref_store))
 }
 
+/// Map a `GitError` to the appropriate Python exception.
+///
+/// Loads exception classes from the `openviking.pyagfs` module. When the
+/// module is not importable (e.g. during unit tests), falls back to
+/// `PyRuntimeError` with the same message.
+pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
+    use ragfs::git::GitError;
+    let msg = e.to_string();
+    match e {
+        GitError::FeatureDisabled => new_py_err(py, "AGFSNotSupportedError", msg),
+        GitError::ConcurrentCommit { .. } => new_py_err(py, "GitConcurrentCommitError", msg),
+        GitError::PathNotFound(_) => new_py_err(py, "AGFSNotFoundError", msg),
+        GitError::PathIsDirectory(_) => new_py_err(py, "AGFSInvalidOperationError", msg),
+        GitError::SubtreeNotFoundInCommit { .. } => new_py_err(py, "AGFSNotFoundError", msg),
+        GitError::InvalidAccountId(_) => new_py_err(py, "AGFSInvalidPathError", msg),
+        GitError::InvalidProjectDir(_) => new_py_err(py, "AGFSInvalidPathError", msg),
+        GitError::BlobTooLarge { .. } => new_py_err(py, "AGFSInvalidOperationError", msg),
+        GitError::TooManyFiles { .. } => new_py_err(py, "AGFSInvalidOperationError", msg),
+        GitError::CorruptedObject(_) => new_py_err(py, "AGFSInternalError", msg),
+        GitError::ObjectStore(_) | GitError::RefStore(_) | GitError::Vfs(_) | GitError::Other(_) => {
+            PyRuntimeError::new_err(msg)
+        }
+    }
+}
+
+/// Local copy of the new_py_err pattern used in lib.rs. We duplicate it here
+/// to keep git.rs self-contained — lib.rs's helper is private. If lib.rs's
+/// helper is later made `pub(crate)`, this can be deleted in favor of that.
+fn new_py_err(py: Python<'_>, name: &str, msg: String) -> PyErr {
+    let exc = PyModule::import(py, "openviking.pyagfs")
+        .and_then(|m| m.getattr(name))
+        .and_then(|exc| Ok(exc.cast_into::<pyo3::types::PyType>()?));
+    match exc {
+        Ok(exc) => PyErr::from_type(exc, msg),
+        Err(_) => PyRuntimeError::new_err(msg),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use ragfs::core::MountableFS;
+    use ragfs::git::GitError;
 
     fn local_cfg(base_dir: &str) -> ragfs::git::GitConfig {
         ragfs::git::GitConfig {
@@ -211,5 +250,63 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("[git.local] missing"));
+    }
+
+    #[test]
+    fn map_git_error_feature_disabled() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let err = map_git_error(py, GitError::FeatureDisabled);
+            // We don't require the openviking.pyagfs module to be importable
+            // in this Rust-only test, so the fallback PyRuntimeError is fine.
+            // We just assert that mapping does not panic and yields a PyErr.
+            assert!(err.to_string().to_lowercase().contains("git"));
+        });
+    }
+
+    #[test]
+    fn map_git_error_concurrent_commit() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let err = map_git_error(
+                py,
+                GitError::ConcurrentCommit {
+                    ref_name: "refs/heads/main".into(),
+                    expected: None,
+                    actual: None,
+                },
+            );
+            assert!(err.to_string().to_lowercase().contains("concurrent"));
+        });
+    }
+
+    #[test]
+    fn map_git_error_path_not_found() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let err = map_git_error(py, GitError::PathNotFound("foo/bar".into()));
+            assert!(err.to_string().contains("foo/bar"));
+        });
+    }
+
+    #[test]
+    fn map_git_error_invalid_account() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let err = map_git_error(py, GitError::InvalidAccountId("../bad".into()));
+            assert!(err.to_string().contains("bad"));
+        });
+    }
+
+    #[test]
+    fn map_git_error_blob_too_large() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let err = map_git_error(
+                py,
+                GitError::BlobTooLarge { size: 200, limit: 100 },
+            );
+            assert!(err.to_string().contains("200"));
+        });
     }
 }
