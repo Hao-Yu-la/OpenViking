@@ -154,16 +154,16 @@ pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
     use ragfs::git::GitError;
     let msg = e.to_string();
     match e {
-        GitError::FeatureDisabled => new_py_err(py, "AGFSNotSupportedError", msg),
-        GitError::ConcurrentCommit { .. } => new_py_err(py, "GitConcurrentCommitError", msg),
-        GitError::PathNotFound(_) => new_py_err(py, "AGFSNotFoundError", msg),
-        GitError::PathIsDirectory(_) => new_py_err(py, "AGFSInvalidOperationError", msg),
-        GitError::SubtreeNotFoundInCommit { .. } => new_py_err(py, "AGFSNotFoundError", msg),
-        GitError::InvalidAccountId(_) => new_py_err(py, "AGFSInvalidPathError", msg),
-        GitError::InvalidProjectDir(_) => new_py_err(py, "AGFSInvalidPathError", msg),
-        GitError::BlobTooLarge { .. } => new_py_err(py, "AGFSInvalidOperationError", msg),
-        GitError::TooManyFiles { .. } => new_py_err(py, "AGFSInvalidOperationError", msg),
-        GitError::CorruptedObject(_) => new_py_err(py, "AGFSInternalError", msg),
+        GitError::FeatureDisabled => new_py_err_pub(py, "AGFSNotSupportedError", msg),
+        GitError::ConcurrentCommit { .. } => new_py_err_pub(py, "GitConcurrentCommitError", msg),
+        GitError::PathNotFound(_) => new_py_err_pub(py, "AGFSNotFoundError", msg),
+        GitError::PathIsDirectory(_) => new_py_err_pub(py, "AGFSInvalidOperationError", msg),
+        GitError::SubtreeNotFoundInCommit { .. } => new_py_err_pub(py, "AGFSNotFoundError", msg),
+        GitError::InvalidAccountId(_) => new_py_err_pub(py, "AGFSInvalidPathError", msg),
+        GitError::InvalidProjectDir(_) => new_py_err_pub(py, "AGFSInvalidPathError", msg),
+        GitError::BlobTooLarge { .. } => new_py_err_pub(py, "AGFSInvalidOperationError", msg),
+        GitError::TooManyFiles { .. } => new_py_err_pub(py, "AGFSInvalidOperationError", msg),
+        GitError::CorruptedObject(_) => new_py_err_pub(py, "AGFSInternalError", msg),
         GitError::ObjectStore(_) | GitError::RefStore(_) | GitError::Vfs(_) | GitError::Other(_) => {
             PyRuntimeError::new_err(msg)
         }
@@ -173,7 +173,7 @@ pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
 /// Local copy of the new_py_err pattern used in lib.rs. We duplicate it here
 /// to keep git.rs self-contained — lib.rs's helper is private. If lib.rs's
 /// helper is later made `pub(crate)`, this can be deleted in favor of that.
-fn new_py_err(py: Python<'_>, name: &str, msg: String) -> PyErr {
+pub fn new_py_err_pub(py: Python<'_>, name: &str, msg: String) -> PyErr {
     let exc = PyModule::import(py, "openviking.pyagfs")
         .and_then(|m| m.getattr(name))
         .and_then(|exc| Ok(exc.cast_into::<pyo3::types::PyType>()?));
