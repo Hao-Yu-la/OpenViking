@@ -276,7 +276,8 @@ fn load_git_from_config(
         Some(git_cfg) => {
             let backend = git_cfg.backend.clone();
             let vfs = fs.clone() as Arc<dyn ragfs::core::FileSystem>;
-            let svc = rt.block_on(async { git::build_git_service(&git_cfg, vfs) })?;
+            let _guard = rt.enter();
+            let svc = git::build_git_service(&git_cfg, vfs)?;
             Ok((svc, Some(backend)))
         }
         None => Ok((None, None)),
@@ -351,39 +352,33 @@ impl RAGFSBindingClient {
     /// Commit a snapshot of the account's tree.
     fn git_commit(&self, py: Python<'_>, kwargs: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let svc = self.git_service.clone().ok_or_else(|| {
-            Python::attach(|p| {
-                git::new_py_err_pub(p, "AGFSNotSupportedError", "git feature disabled".into())
-            })
+            git::new_py_err_pub(py, "AGFSNotSupportedError", "git feature disabled".into())
         })?;
         let req = git::parse_commit_request(kwargs)?;
         let resp = py_detach_blocking(py, move || self.rt.block_on(svc.commit(req)))
-            .map_err(|e| Python::attach(|p| git::map_git_error(p, e)))?;
+            .map_err(|e| git::map_git_error(py, e))?;
         git::commit_response_to_pydict(py, resp)
     }
 
     /// Restore a project_dir subtree to the state at source_commit.
     fn git_restore(&self, py: Python<'_>, kwargs: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let svc = self.git_service.clone().ok_or_else(|| {
-            Python::attach(|p| {
-                git::new_py_err_pub(p, "AGFSNotSupportedError", "git feature disabled".into())
-            })
+            git::new_py_err_pub(py, "AGFSNotSupportedError", "git feature disabled".into())
         })?;
         let req = git::parse_restore_request(kwargs)?;
         let resp = py_detach_blocking(py, move || self.rt.block_on(svc.restore(req)))
-            .map_err(|e| Python::attach(|p| git::map_git_error(p, e)))?;
+            .map_err(|e| git::map_git_error(py, e))?;
         git::restore_response_to_pydict(py, resp)
     }
 
     /// Read a commit's metadata or a blob's bytes at a path.
     fn git_show(&self, py: Python<'_>, kwargs: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let svc = self.git_service.clone().ok_or_else(|| {
-            Python::attach(|p| {
-                git::new_py_err_pub(p, "AGFSNotSupportedError", "git feature disabled".into())
-            })
+            git::new_py_err_pub(py, "AGFSNotSupportedError", "git feature disabled".into())
         })?;
         let req = git::parse_show_request(kwargs)?;
         let resp = py_detach_blocking(py, move || self.rt.block_on(svc.show(req)))
-            .map_err(|e| Python::attach(|p| git::map_git_error(p, e)))?;
+            .map_err(|e| git::map_git_error(py, e))?;
         git::show_response_to_pydict(py, resp)
     }
 
