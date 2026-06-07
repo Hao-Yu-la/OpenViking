@@ -183,6 +183,209 @@ fn new_py_err(py: Python<'_>, name: &str, msg: String) -> PyErr {
     }
 }
 
+use pyo3::types::{PyBytes, PyDict, PyList};
+use ragfs::git::{
+    Actor, CommitRequest, CommitResponse, RestoreDiff, RestoreRequest, RestoreResponse,
+    ShowRequest, ShowResponse,
+};
+
+// ---------- request parsers ----------
+
+fn require_str(kwargs: &Bound<PyDict>, key: &str) -> PyResult<String> {
+    let val = kwargs
+        .get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("missing required kwarg: {}", key)))?;
+    val.extract::<String>().map_err(|_| {
+        PyValueError::new_err(format!("kwarg {} must be a string", key))
+    })
+}
+
+fn optional_str(kwargs: &Bound<PyDict>, key: &str) -> PyResult<Option<String>> {
+    match kwargs.get_item(key)? {
+        Some(v) if !v.is_none() => v
+            .extract::<String>()
+            .map(Some)
+            .map_err(|_| PyValueError::new_err(format!("kwarg {} must be a string", key))),
+        _ => Ok(None),
+    }
+}
+
+fn optional_bool(kwargs: &Bound<PyDict>, key: &str, default: bool) -> PyResult<bool> {
+    match kwargs.get_item(key)? {
+        Some(v) if !v.is_none() => v
+            .extract::<bool>()
+            .map_err(|_| PyValueError::new_err(format!("kwarg {} must be a bool", key))),
+        _ => Ok(default),
+    }
+}
+
+fn optional_string_list(
+    kwargs: &Bound<PyDict>,
+    key: &str,
+) -> PyResult<Option<Vec<String>>> {
+    match kwargs.get_item(key)? {
+        Some(v) if !v.is_none() => v
+            .extract::<Vec<String>>()
+            .map(Some)
+            .map_err(|_| {
+                PyValueError::new_err(format!("kwarg {} must be a list of strings", key))
+            }),
+        _ => Ok(None),
+    }
+}
+
+pub fn parse_commit_request(kwargs: &Bound<PyDict>) -> PyResult<CommitRequest> {
+    Ok(CommitRequest {
+        account: require_str(kwargs, "account")?,
+        branch: require_str(kwargs, "branch")?,
+        message: require_str(kwargs, "message")?,
+        paths: optional_string_list(kwargs, "paths")?,
+        author_name: require_str(kwargs, "author_name")?,
+        author_email: require_str(kwargs, "author_email")?,
+    })
+}
+
+pub fn parse_restore_request(kwargs: &Bound<PyDict>) -> PyResult<RestoreRequest> {
+    Ok(RestoreRequest {
+        account: require_str(kwargs, "account")?,
+        branch: require_str(kwargs, "branch")?,
+        project_dir: require_str(kwargs, "project_dir")?,
+        source_commit: require_str(kwargs, "source_commit")?,
+        dry_run: optional_bool(kwargs, "dry_run", false)?,
+        message: optional_str(kwargs, "message")?,
+        author_name: require_str(kwargs, "author_name")?,
+        author_email: require_str(kwargs, "author_email")?,
+    })
+}
+
+pub fn parse_show_request(kwargs: &Bound<PyDict>) -> PyResult<ShowRequest> {
+    Ok(ShowRequest {
+        account: require_str(kwargs, "account")?,
+        target_ref: require_str(kwargs, "target_ref")?,
+        path: optional_str(kwargs, "path")?,
+    })
+}
+
+// ---------- response converters ----------
+
+fn oid_hex(oid: &gix_hash::ObjectId) -> String {
+    oid.to_hex().to_string()
+}
+
+fn actor_to_dict(py: Python<'_>, a: &Actor) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("name", &a.name)?;
+    d.set_item("email", &a.email)?;
+    d.set_item("time_seconds", a.time_seconds)?;
+    d.set_item("tz_offset_seconds", a.tz_offset_seconds)?;
+    Ok(d.into())
+}
+
+pub fn commit_response_to_pydict(
+    py: Python<'_>,
+    resp: CommitResponse,
+) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    match resp {
+        CommitResponse::Created { commit_oid, changed } => {
+            d.set_item("result", "created")?;
+            d.set_item("commit_oid", oid_hex(&commit_oid))?;
+            d.set_item("changed", changed)?;
+        }
+        CommitResponse::Noop { commit_oid } => {
+            d.set_item("result", "noop")?;
+            d.set_item("commit_oid", oid_hex(&commit_oid))?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
+fn diff_to_dict(py: Python<'_>, diff: &RestoreDiff) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    let to_write = PyList::empty(py);
+    for (path, oid) in &diff.to_write {
+        let pair = PyDict::new(py);
+        pair.set_item("path", path)?;
+        pair.set_item("oid", oid_hex(oid))?;
+        to_write.append(pair)?;
+    }
+    d.set_item("to_write", to_write)?;
+    d.set_item("to_delete", diff.to_delete.clone())?;
+    d.set_item("unchanged", diff.unchanged.clone())?;
+    Ok(d.into())
+}
+
+pub fn restore_response_to_pydict(
+    py: Python<'_>,
+    resp: RestoreResponse,
+) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    match resp {
+        RestoreResponse::Applied {
+            new_commit_oid,
+            source_commit,
+            parent_commit,
+            written,
+            deleted,
+            unchanged,
+        } => {
+            d.set_item("result", "applied")?;
+            d.set_item("new_commit_oid", oid_hex(&new_commit_oid))?;
+            d.set_item("source_commit", oid_hex(&source_commit))?;
+            d.set_item("parent_commit", oid_hex(&parent_commit))?;
+            d.set_item("written", written)?;
+            d.set_item("deleted", deleted)?;
+            d.set_item("unchanged", unchanged)?;
+        }
+        RestoreResponse::Noop { head, source } => {
+            d.set_item("result", "noop")?;
+            d.set_item("head", oid_hex(&head))?;
+            d.set_item("source", oid_hex(&source))?;
+        }
+        RestoreResponse::DryRun { diff, head, source } => {
+            d.set_item("result", "dry_run")?;
+            d.set_item("head", oid_hex(&head))?;
+            d.set_item("source", oid_hex(&source))?;
+            d.set_item("diff", diff_to_dict(py, &diff)?)?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
+pub fn show_response_to_pydict(
+    py: Python<'_>,
+    resp: ShowResponse,
+) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    match resp {
+        ShowResponse::Commit {
+            oid,
+            tree,
+            parents,
+            author,
+            committer,
+            message,
+        } => {
+            d.set_item("oid", oid_hex(&oid))?;
+            d.set_item("tree", oid_hex(&tree))?;
+            let plist = PyList::empty(py);
+            for p in &parents {
+                plist.append(oid_hex(p))?;
+            }
+            d.set_item("parents", plist)?;
+            d.set_item("author", actor_to_dict(py, &author)?)?;
+            d.set_item("committer", actor_to_dict(py, &committer)?)?;
+            d.set_item("message", message)?;
+        }
+        ShowResponse::Blob { oid, size, bytes } => {
+            d.set_item("oid", oid_hex(&oid))?;
+            d.set_item("size", size)?;
+            d.set_item("bytes", PyBytes::new(py, &bytes))?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +510,159 @@ mod tests {
                 GitError::BlobTooLarge { size: 200, limit: 100 },
             );
             assert!(err.to_string().contains("200"));
+        });
+    }
+
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn parse_commit_request_required_fields() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("account", "acct1").unwrap();
+            kwargs.set_item("branch", "main").unwrap();
+            kwargs.set_item("message", "hello").unwrap();
+            kwargs.set_item("author_name", "alice").unwrap();
+            kwargs.set_item("author_email", "a@e.com").unwrap();
+            let req = parse_commit_request(&kwargs).expect("parses");
+            assert_eq!(req.account, "acct1");
+            assert_eq!(req.branch, "main");
+            assert_eq!(req.message, "hello");
+            assert!(req.paths.is_none());
+            assert_eq!(req.author_name, "alice");
+            assert_eq!(req.author_email, "a@e.com");
+        });
+    }
+
+    #[test]
+    fn parse_commit_request_with_paths_list() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("account", "a").unwrap();
+            kwargs.set_item("branch", "main").unwrap();
+            kwargs.set_item("message", "m").unwrap();
+            kwargs.set_item("author_name", "n").unwrap();
+            kwargs.set_item("author_email", "e").unwrap();
+            kwargs.set_item("paths", vec!["resources/a.md", "resources/b.md"]).unwrap();
+            let req = parse_commit_request(&kwargs).expect("parses");
+            assert_eq!(req.paths.as_ref().unwrap().len(), 2);
+            assert_eq!(req.paths.as_ref().unwrap()[0], "resources/a.md");
+        });
+    }
+
+    #[test]
+    fn parse_commit_request_missing_required_errors() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("branch", "main").unwrap();
+            // missing account, message, author_*
+            let err = parse_commit_request(&kwargs).unwrap_err();
+            assert!(err.to_string().contains("account"));
+        });
+    }
+
+    #[test]
+    fn parse_restore_request_defaults() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("account", "a").unwrap();
+            kwargs.set_item("branch", "main").unwrap();
+            kwargs.set_item("project_dir", "resources/proj").unwrap();
+            kwargs.set_item("source_commit", "deadbeef").unwrap();
+            kwargs.set_item("author_name", "n").unwrap();
+            kwargs.set_item("author_email", "e").unwrap();
+            let req = parse_restore_request(&kwargs).expect("parses");
+            assert!(!req.dry_run);
+            assert!(req.message.is_none());
+        });
+    }
+
+    #[test]
+    fn parse_restore_request_dry_run_and_message() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("account", "a").unwrap();
+            kwargs.set_item("branch", "main").unwrap();
+            kwargs.set_item("project_dir", "x").unwrap();
+            kwargs.set_item("source_commit", "abc123").unwrap();
+            kwargs.set_item("author_name", "n").unwrap();
+            kwargs.set_item("author_email", "e").unwrap();
+            kwargs.set_item("dry_run", true).unwrap();
+            kwargs.set_item("message", "custom msg").unwrap();
+            let req = parse_restore_request(&kwargs).expect("parses");
+            assert!(req.dry_run);
+            assert_eq!(req.message.as_deref(), Some("custom msg"));
+        });
+    }
+
+    #[test]
+    fn parse_show_request_with_and_without_path() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("account", "a").unwrap();
+            kwargs.set_item("target_ref", "main").unwrap();
+            let req = parse_show_request(&kwargs).expect("parses");
+            assert!(req.path.is_none());
+
+            let kwargs2 = PyDict::new(py);
+            kwargs2.set_item("account", "a").unwrap();
+            kwargs2.set_item("target_ref", "main").unwrap();
+            kwargs2.set_item("path", "resources/a.md").unwrap();
+            let req2 = parse_show_request(&kwargs2).expect("parses");
+            assert_eq!(req2.path.as_deref(), Some("resources/a.md"));
+        });
+    }
+
+    #[test]
+    fn commit_response_created_to_dict() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let oid = gix_hash::ObjectId::null(gix_hash::Kind::Sha1);
+            let resp = ragfs::git::CommitResponse::Created { commit_oid: oid, changed: 3 };
+            let obj = commit_response_to_pydict(py, resp).expect("converts");
+            let d: &Bound<PyDict> = obj.bind(py).downcast().unwrap();
+            let result: String = d.get_item("result").unwrap().unwrap().extract().unwrap();
+            assert_eq!(result, "created");
+            let changed: usize = d.get_item("changed").unwrap().unwrap().extract().unwrap();
+            assert_eq!(changed, 3);
+        });
+    }
+
+    #[test]
+    fn commit_response_noop_to_dict() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let oid = gix_hash::ObjectId::null(gix_hash::Kind::Sha1);
+            let resp = ragfs::git::CommitResponse::Noop { commit_oid: oid };
+            let obj = commit_response_to_pydict(py, resp).expect("converts");
+            let d: &Bound<PyDict> = obj.bind(py).downcast().unwrap();
+            let result: String = d.get_item("result").unwrap().unwrap().extract().unwrap();
+            assert_eq!(result, "noop");
+        });
+    }
+
+    #[test]
+    fn show_response_blob_to_dict_carries_bytes() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let oid = gix_hash::ObjectId::null(gix_hash::Kind::Sha1);
+            let resp = ragfs::git::ShowResponse::Blob {
+                oid,
+                size: 5,
+                bytes: bytes::Bytes::from_static(b"hello"),
+            };
+            let obj = show_response_to_pydict(py, resp).expect("converts");
+            let d: &Bound<PyDict> = obj.bind(py).downcast().unwrap();
+            let b: Vec<u8> = d.get_item("bytes").unwrap().unwrap().extract().unwrap();
+            assert_eq!(b, b"hello".to_vec());
+            let size: u64 = d.get_item("size").unwrap().unwrap().extract().unwrap();
+            assert_eq!(size, 5);
         });
     }
 }

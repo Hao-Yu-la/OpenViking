@@ -3803,6 +3803,8 @@ dependencies = [
 name = "ragfs-python"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "gix-hash",
  "pyo3",
  "ragfs",
  "serde",
