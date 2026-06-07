@@ -21,6 +21,8 @@ use ragfs::plugins::{
     KVFSPlugin, LocalFSPlugin, MemFSPlugin, QueueFSPlugin, SQLFSPlugin, ServerInfoFSPlugin,
 };
 
+mod git;
+
 fn py_detach_blocking<T, F>(py: Python<'_>, f: F) -> T
 where
     T: Send,
