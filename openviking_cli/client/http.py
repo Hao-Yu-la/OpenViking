@@ -1143,8 +1143,25 @@ class AsyncHTTPClient(BaseClient):
         *,
         path: Optional[str] = None,
     ) -> Any:
-        """Git operations require embedded mode."""
-        raise NotImplementedError("Git version control is only supported in embedded mode")
+        """Fetch commit metadata (path=None) or a blob's {oid, size, bytes} (path=<uri>)."""
+        params: Dict[str, Any] = {"target_ref": target_ref}
+        if path is not None:
+            params["path"] = path
+        response = await self._http.get("/api/v1/snapshot/show", params=params)
+
+        if path is None:
+            return self._handle_response(response)
+
+        # Binary branch: server sets application/octet-stream + X-Snapshot-* headers.
+        content_type = response.headers.get("content-type", "")
+        if content_type.startswith("application/octet-stream"):
+            return {
+                "oid": response.headers.get("x-snapshot-oid", ""),
+                "size": int(response.headers.get("x-snapshot-size", "0")),
+                "bytes": response.content,
+            }
+        # Fallback: server returned a JSON error envelope. Let the standard handler raise.
+        return self._handle_response(response)
 
     async def git_log(
         self,
