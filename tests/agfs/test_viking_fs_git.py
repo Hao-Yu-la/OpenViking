@@ -506,7 +506,7 @@ async def test_restore_schedules_reindex_for_derived_only_change(vfs, monkeypatc
             return {"ok": True}
 
     import openviking.service.reindex_executor as reindex_mod
-    monkeypatch.setattr(reindex_mod, "ReindexExecutor", _SpyExecutor)
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
 
     ctx = _make_ctx(account="acct_derived_only")
     await vfs.write_file("viking://resources/proj/x.md", b"body", ctx=ctx)
@@ -544,9 +544,10 @@ async def test_restore_schedules_reindex_for_derived_only_change(vfs, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_restore_schedules_reindex_dedupes_source_and_sidecar(vfs, monkeypatch):
-    """Source file + its sidecar in the same restore -> two distinct URIs
-    (one for the file's DETAIL, one for the parent dir's L0/L1), no dup.
+async def test_restore_schedules_reindex_subsumes_files_under_scheduled_dir(vfs, monkeypatch):
+    """When a directory URI is scheduled (because a derived sidecar was
+    restored), any source-file URI inside that directory must be dropped —
+    ReindexExecutor's directory walk already reindexes every leaf's DETAIL.
     """
     calls: list[str] = []
 
@@ -556,7 +557,7 @@ async def test_restore_schedules_reindex_dedupes_source_and_sidecar(vfs, monkeyp
             return {"ok": True}
 
     import openviking.service.reindex_executor as reindex_mod
-    monkeypatch.setattr(reindex_mod, "ReindexExecutor", _SpyExecutor)
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
 
     ctx = _make_ctx(account="acct_dedup")
     await vfs.write_file("viking://resources/proj/x.md", b"v1", ctx=ctx)
@@ -585,9 +586,55 @@ async def test_restore_schedules_reindex_dedupes_source_and_sidecar(vfs, monkeyp
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    # Two distinct sidecars in same dir -> dir URI appears once; source file
-    # adds its own URI.
+    # The directory URI subsumes the source file URI — only the dir runs.
+    assert calls == ["viking://resources/proj"]
+
+
+@pytest.mark.asyncio
+async def test_restore_schedules_reindex_keeps_files_outside_scheduled_dir(vfs, monkeypatch):
+    """A source file in a sibling directory must NOT be dropped just because
+    another directory is scheduled — only descendants of scheduled dirs are
+    subsumed.
+    """
+    calls: list[str] = []
+
+    class _SpyExecutor:
+        async def execute(self, *, uri, mode, wait, ctx):
+            calls.append(uri)
+            return {"ok": True}
+
+    import openviking.service.reindex_executor as reindex_mod
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
+
+    ctx = _make_ctx(account="acct_subsume_sibling")
+    # proj_a: source file + derived sidecar (will produce dir + file URIs)
+    await vfs.write_file("viking://resources/proj_a/x.md", b"v1", ctx=ctx)
+    await vfs.write_file(
+        "viking://resources/proj_a/x.md.abstract.md", b"a-v1", ctx=ctx
+    )
+    # proj_b: source file only (no derived) — sibling directory
+    await vfs.write_file("viking://resources/proj_b/y.md", b"v1", ctx=ctx)
+    c1 = await vfs.commit(message="v1", ctx=ctx)
+
+    await vfs.write_file("viking://resources/proj_a/x.md", b"v2", ctx=ctx)
+    await vfs.write_file(
+        "viking://resources/proj_a/x.md.abstract.md", b"a-v2", ctx=ctx
+    )
+    await vfs.write_file("viking://resources/proj_b/y.md", b"v2", ctx=ctx)
+    await vfs.commit(message="v2", ctx=ctx)
+
+    # Restore the whole resources scope so proj_a + proj_b both revert
+    await vfs.restore(
+        project_dir="viking://resources",
+        source_commit=c1["commit_oid"],
+        ctx=ctx,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # proj_a's sidecar -> viking://resources/proj_a (dir, subsumes x.md)
+    # proj_b/y.md -> viking://resources/proj_b/y.md (no dir scheduled -> kept)
     assert sorted(calls) == sorted([
-        "viking://resources/proj",
-        "viking://resources/proj/x.md",
+        "viking://resources/proj_a",
+        "viking://resources/proj_b/y.md",
     ])

@@ -2914,16 +2914,26 @@ class VikingFS:
         Derived files (`.abstract.md` / `.overview.md` / `.relations.json` and
         their per-file sidecars) are redirected to their parent directory so
         the directory-level L0/L1 vectors get recomputed from the restored
-        on-disk content. Source files are reindexed directly. URIs are
-        deduplicated. Failures are logged and never propagate.
+        on-disk content. Source files are reindexed directly.
+
+        Two layers of deduplication are applied to avoid wasted embedding
+        work:
+
+        1. Exact URI dedup — the same URI scheduled multiple times runs once.
+        2. Ancestor subsumption — if a directory URI is scheduled (from a
+           restored derived file), any source-file URI under that directory is
+           dropped, because :class:`ReindexExecutor` already recurses through
+           the directory and reindexes every leaf's DETAIL vector. Keeping
+           both would double-embed every covered file.
+
+        Failures are logged and never propagate.
         """
         try:
-            from openviking.service.reindex_executor import ReindexExecutor
+            from openviking.service.reindex_executor import get_reindex_executor
         except Exception:
             logger.exception("[VikingFS] ReindexExecutor import failed; skipping rebuild")
             return
 
-        executor = ReindexExecutor()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -2932,19 +2942,49 @@ class VikingFS:
             )
             return
 
-        seen: set[str] = set()
+        # Pass 1: collect unique URIs and classify by whether they came from
+        # a derived (directory-scope) path or a source (file-scope) path.
+        dir_uris: set[str] = set()
+        file_uris: set[str] = set()
         for tree_path in tree_paths:
             try:
                 uri = self._reindex_uri_for_tree_path(tree_path)
             except ValueError:
                 continue
-            if uri is None or uri in seen:
+            if uri is None:
                 continue
-            seen.add(uri)
+            if self._is_derived_tree_path(tree_path):
+                dir_uris.add(uri)
+            else:
+                file_uris.add(uri)
+
+        # Pass 2: drop any file URI strictly under a scheduled directory URI;
+        # the directory task already covers it.
+        effective: set[str] = set(dir_uris)
+        for file_uri in file_uris:
+            if any(file_uri.startswith(d + "/") for d in dir_uris):
+                continue
+            effective.add(file_uri)
+
+        executor = get_reindex_executor()
+        for uri in effective:
             loop.create_task(
                 self._run_vector_rebuild(executor, uri, ctx),
                 name=f"vikingfs-git-reindex:{uri}",
             )
+
+    @classmethod
+    def _is_derived_tree_path(cls, tree_path: str) -> bool:
+        """True iff the tree path's basename is a derived L0/L1 marker or
+        per-file sidecar — i.e. :py:meth:`_reindex_uri_for_tree_path` will
+        redirect it to its parent directory."""
+        name = tree_path.rpartition("/")[2]
+        if name in cls._DERIVED_BASENAMES:
+            return True
+        return any(
+            name.endswith(s) and len(name) > len(s)
+            for s in cls._DERIVED_SIDECAR_SUFFIXES
+        )
 
     async def _run_vector_rebuild(
         self,
