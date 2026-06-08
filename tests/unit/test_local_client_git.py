@@ -100,7 +100,6 @@ async def test_show_metadata(local_client, mock_fs):
 @pytest.mark.asyncio
 async def test_show_with_path(local_client, mock_fs):
     mock_fs.show = AsyncMock(return_value=b"blob data")
-    local_client._service.fs = mock_fs
     out = await local_client.git_show("main", path="viking://resources/a.md")
     mock_fs.show.assert_awaited_once_with("main", path="viking://resources/a.md", ctx=local_client._ctx)
     assert out == b"blob data"
