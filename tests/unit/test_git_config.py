@@ -64,15 +64,7 @@ class TestGitConfigOnOpenVikingConfig:
         assert cfg.git.local.fsync == "on"
 
     def test_git_config_round_trip_via_config_file(self, tmp_path, monkeypatch):
-        """Round-trip a git section through OpenVikingConfig file loader.
-
-        NOTE: `_load_from_file` in this project uses json.loads (not toml),
-        so the on-disk file is JSON. We exercise the same load path the
-        runtime uses, just to confirm the new `git` field survives the round trip.
-
-        The loader lives on OpenVikingConfigSingleton (not on OpenVikingConfig
-        itself); we call it directly to exercise the real file-load path.
-        """
+        """Round-trip the new `git` section through the runtime JSON file loader."""
         from openviking_cli.utils.config.open_viking_config import (
             OpenVikingConfigSingleton,
         )
@@ -91,10 +83,7 @@ class TestGitConfigOnOpenVikingConfig:
         cfg_path = tmp_path / "ov.conf"
         cfg_path.write_text(json.dumps(cfg_dict))
 
-        if hasattr(OpenVikingConfig, "from_file"):
-            cfg = OpenVikingConfig.from_file(str(cfg_path))
-        else:
-            cfg = OpenVikingConfigSingleton._load_from_file(str(cfg_path))
+        cfg = OpenVikingConfigSingleton._load_from_file(str(cfg_path))
 
         assert cfg.git.enabled is True
         assert cfg.git.local.base_dir == str(tmp_path / "git")

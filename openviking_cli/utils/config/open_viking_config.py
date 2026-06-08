@@ -93,7 +93,6 @@ class OpenVikingConfig(BaseModel):
         default_factory=EncryptionConfig, description="Encryption configuration"
     )
 
-    # Git version control configuration (opt-in)
     git: GitConfig = Field(
         default_factory=GitConfig, description="Git version control configuration"
     )
