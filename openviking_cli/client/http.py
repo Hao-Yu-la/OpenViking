@@ -1088,6 +1088,52 @@ class AsyncHTTPClient(BaseClient):
         result = self._handle_response(response)
         return result.get("uri", "")
 
+    # ============= Git Version Control =============
+
+    async def git_commit(
+        self,
+        *,
+        message: str,
+        paths: Optional[List[str]] = None,
+        branch: str = "main",
+        author_name: Optional[str] = None,
+        author_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Git operations require embedded mode."""
+        raise NotImplementedError("Git version control is only supported in embedded mode")
+
+    async def git_restore(
+        self,
+        *,
+        project_dir: str,
+        source_commit: str,
+        branch: str = "main",
+        dry_run: bool = False,
+        message: Optional[str] = None,
+        author_name: Optional[str] = None,
+        author_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Git operations require embedded mode."""
+        raise NotImplementedError("Git version control is only supported in embedded mode")
+
+    async def git_show(
+        self,
+        target_ref: str,
+        *,
+        path: Optional[str] = None,
+    ) -> Any:
+        """Git operations require embedded mode."""
+        raise NotImplementedError("Git version control is only supported in embedded mode")
+
+    async def git_log(
+        self,
+        *,
+        branch: str = "main",
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Git operations require embedded mode."""
+        raise NotImplementedError("Git version control is only supported in embedded mode")
+
     # ============= Debug =============
 
     async def check_consistency(self, uri: str) -> Dict[str, Any]:
