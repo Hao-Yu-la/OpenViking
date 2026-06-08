@@ -1099,8 +1099,16 @@ class AsyncHTTPClient(BaseClient):
         author_name: Optional[str] = None,
         author_email: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Git operations require embedded mode."""
-        raise NotImplementedError("Git version control is only supported in embedded mode")
+        """Create a snapshot of the current workspace state."""
+        body: Dict[str, Any] = {"message": message, "branch": branch}
+        if paths is not None:
+            body["paths"] = paths
+        if author_name is not None:
+            body["author_name"] = author_name
+        if author_email is not None:
+            body["author_email"] = author_email
+        response = await self._http.post("/api/v1/snapshot/commit", json=body)
+        return self._handle_response(response)
 
     async def git_restore(
         self,
