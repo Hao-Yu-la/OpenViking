@@ -36,6 +36,7 @@ from openviking_cli.exceptions import NotInitializedError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import OPENVIKING_ENABLE_RECORDER_ENV, get_openviking_config
+from openviking_cli.utils.config.git_config import GitConfig
 from openviking_cli.utils.config.open_viking_config import initialize_openviking_config
 from openviking_cli.utils.config.storage_config import StorageConfig
 
@@ -100,7 +101,10 @@ class OpenVikingService:
 
         # Initialize storage
         self._init_storage(
-            config.storage, config.embedding.max_concurrent, config.vlm.max_concurrent
+            config.storage,
+            config.embedding.max_concurrent,
+            config.vlm.max_concurrent,
+            git_config=config.git,
         )
 
         # Initialize embedder
@@ -114,12 +118,14 @@ class OpenVikingService:
         config: StorageConfig,
         max_concurrent_embedding: int = 10,
         max_concurrent_semantic: int = 64,
+        *,
+        git_config: Optional[GitConfig] = None,
     ) -> None:
         """Initialize storage resources."""
         from openviking.utils.agfs_utils import create_agfs_client
 
         # Create RAGFS client using utility
-        self._agfs_client = create_agfs_client(config.agfs)
+        self._agfs_client = create_agfs_client(config.agfs, git_config=git_config)
 
         # Initialize QueueManager with agfs_client
         if self._agfs_client:
@@ -255,6 +261,7 @@ class OpenVikingService:
                 self._config.storage,
                 self._config.embedding.max_concurrent,
                 self._config.vlm.max_concurrent,
+                git_config=self._config.git,
             )
 
         if self._embedder is None:

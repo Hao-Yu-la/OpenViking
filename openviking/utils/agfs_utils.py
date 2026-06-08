@@ -135,12 +135,52 @@ def _generate_plugin_config(agfs_config: Any, data_path: Path) -> Dict[str, Any]
     return config
 
 
-def create_agfs_client(agfs_config: Any) -> Any:
+def _render_git_toml(git_config: Any, storage_path: Path) -> str:
+    """Render a TOML body with [git] and [git.local] sections from a GitConfig.
+
+    The format mirrors the working fixture used in the ragfs_python binding tests
+    (see tests/agfs/test_viking_fs_git.py). When ``git_config.local.base_dir`` is
+    empty, it defaults to ``{storage_path}/git``.
+    """
+    local_cfg = getattr(git_config, "local", None)
+    base_dir = getattr(local_cfg, "base_dir", "") if local_cfg is not None else ""
+    if not base_dir:
+        base_dir = str(storage_path / "git")
+    else:
+        base_dir = str(Path(base_dir).expanduser())
+    fsync = getattr(local_cfg, "fsync", "off") if local_cfg is not None else "off"
+
+    enabled = "true" if getattr(git_config, "enabled", False) else "false"
+    backend = getattr(git_config, "backend", "local")
+    default_branch = getattr(git_config, "default_branch", "main")
+    author_name = getattr(git_config, "author_name", "viking-bot")
+    author_email = getattr(git_config, "author_email", "bot@viking.local")
+
+    return (
+        "[git]\n"
+        f"enabled = {enabled}\n"
+        f'backend = "{backend}"\n'
+        f'default_branch = "{default_branch}"\n'
+        f'author_name = "{author_name}"\n'
+        f'author_email = "{author_email}"\n'
+        "\n"
+        "[git.local]\n"
+        f'base_dir = "{base_dir}"\n'
+        f'fsync = "{fsync}"\n'
+    )
+
+
+def create_agfs_client(agfs_config: Any, *, git_config: Any = None) -> Any:
     """
     Create a RAGFS client based on the provided configuration.
 
     Args:
         agfs_config: RAGFS configuration object.
+        git_config: Optional GitConfig. When provided and ``enabled`` is True,
+            a ragfs.toml is generated under ``{agfs_config.path}/.runtime/`` and
+            its path is passed to ``RAGFSBindingClient`` via ``config_path=`` so
+            the binding exposes git_* methods. When None or disabled, the client
+            is constructed with no args (legacy behavior).
 
     Returns:
         A RAGFSBindingClient instance.
@@ -161,7 +201,18 @@ def create_agfs_client(agfs_config: Any) -> Any:
             "to build and install the RAGFS SDK with native bindings."
         )
 
-    client = RAGFSBindingClient()
+    if git_config is not None and getattr(git_config, "enabled", False):
+        path_str = getattr(agfs_config, "path", None)
+        if path_str is None:
+            raise ValueError("agfs_config.path is required when git is enabled")
+        storage_path = Path(path_str).resolve()
+        runtime_dir = storage_path / ".runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        toml_path = runtime_dir / "ragfs.toml"
+        toml_path.write_text(_render_git_toml(git_config, storage_path))
+        client = RAGFSBindingClient(config_path=str(toml_path))
+    else:
+        client = RAGFSBindingClient()
 
     # Automatically mount backend for binding client
     mount_agfs_backend(client, agfs_config)
