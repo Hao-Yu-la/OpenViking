@@ -86,6 +86,8 @@ class AsyncOpenViking:
             await client.close()
         self._initialized = False
         self._singleton_initialized = False
+        # Clear any cached namespaces so they re-bind on next access.
+        self._git = None
 
     @classmethod
     async def reset(cls) -> None:
@@ -309,6 +311,18 @@ class AsyncOpenViking:
     @property
     def _service(self):
         return self._client.service
+
+    @property
+    def git(self) -> "AsyncGitNamespace":
+        """Git version control namespace.
+
+        Lazy-initialized on first access so importing the client does not
+        pull in the git module when it's not needed.
+        """
+        if not hasattr(self, "_git") or self._git is None:
+            from openviking.git_namespace import AsyncGitNamespace
+            self._git = AsyncGitNamespace(self)
+        return self._git
 
     async def wait_processed(self, timeout: float = None) -> Dict[str, Any]:
         """Wait for all queued processing to complete."""
