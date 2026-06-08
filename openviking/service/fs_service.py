@@ -359,6 +359,18 @@ class FSService:
         path = validate_optional_viking_uri(path, field_name="path") or None
         return await viking_fs.show(target_ref, path=path, ctx=ctx)
 
+    async def show_blob_raw(
+        self,
+        target_ref: str,
+        ctx: RequestContext,
+        *,
+        path: str,
+    ) -> Dict[str, Any]:
+        """Forward to VikingFS.show_blob_raw. Returns ``{"oid", "size", "bytes"}``."""
+        viking_fs = self._ensure_initialized()
+        path = validate_viking_uri(path, field_name="path")
+        return await viking_fs.show_blob_raw(target_ref, path=path, ctx=ctx)
+
     async def log(
         self,
         ctx: RequestContext,
