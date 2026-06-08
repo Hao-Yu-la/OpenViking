@@ -355,6 +355,7 @@ class FSService:
     ) -> Any:
         """Forward to VikingFS.show. Returns dict (metadata) or bytes (blob)."""
         viking_fs = self._ensure_initialized()
+        # validate_optional_viking_uri returns "" for None input; VikingFS.show needs None.
         path = validate_optional_viking_uri(path, field_name="path") or None
         return await viking_fs.show(target_ref, path=path, ctx=ctx)
 
