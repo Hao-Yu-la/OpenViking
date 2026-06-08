@@ -1121,8 +1121,21 @@ class AsyncHTTPClient(BaseClient):
         author_name: Optional[str] = None,
         author_email: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Git operations require embedded mode."""
-        raise NotImplementedError("Git version control is only supported in embedded mode")
+        """Forward-commit restore of a project directory to a past snapshot."""
+        body: Dict[str, Any] = {
+            "project_dir": project_dir,
+            "source_commit": source_commit,
+            "branch": branch,
+            "dry_run": dry_run,
+        }
+        if message is not None:
+            body["message"] = message
+        if author_name is not None:
+            body["author_name"] = author_name
+        if author_email is not None:
+            body["author_email"] = author_email
+        response = await self._http.post("/api/v1/snapshot/restore", json=body)
+        return self._handle_response(response)
 
     async def git_show(
         self,

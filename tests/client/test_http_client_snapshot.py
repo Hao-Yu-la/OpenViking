@@ -66,3 +66,26 @@ async def test_git_commit_omits_none_fields():
 
     call = fake.calls[-1]
     assert call["json"] == {"message": "hi", "branch": "main"}
+
+
+async def test_git_restore_posts_required_fields():
+    client, fake = _client_with_fake()
+    client._handle_response = lambda resp: {"result": "noop", "head": "h" * 40, "source": "s" * 40}
+    fake.next_response = object()
+
+    result = await client.git_restore(
+        project_dir="viking://resources",
+        source_commit="s" * 40,
+        dry_run=True,
+    )
+
+    assert result["result"] == "noop"
+    call = fake.calls[-1]
+    assert call["method"] == "POST"
+    assert call["path"] == "/api/v1/snapshot/restore"
+    assert call["json"] == {
+        "project_dir": "viking://resources",
+        "source_commit": "s" * 40,
+        "branch": "main",
+        "dry_run": True,
+    }
