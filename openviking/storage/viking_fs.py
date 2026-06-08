@@ -2877,6 +2877,34 @@ class VikingFS:
             return resp["bytes"]
         return resp
 
+    async def show_blob_raw(
+        self,
+        target_ref: str,
+        *,
+        path: str,
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict[str, Any]:
+        """Like ``show(target_ref, path=...)`` but returns the full envelope.
+
+        Returns ``{"oid": str, "size": int, "bytes": bytes}`` without
+        stripping. Used by the HTTP snapshot router to populate
+        ``X-Snapshot-Oid`` / ``X-Snapshot-Size`` response headers.
+        """
+        real_ctx = self._ctx_or_default(ctx)
+        account = real_ctx.account_id
+        tree_path = self._uri_to_tree_path(path, ctx=real_ctx)
+        resp = await self._async_agfs.run(
+            "git_show",
+            account=account,
+            target_ref=target_ref,
+            path=tree_path,
+        )
+        if not isinstance(resp, dict) or "bytes" not in resp:
+            raise TypeError(
+                f"git_show returned unexpected shape for blob path: {type(resp).__name__}"
+            )
+        return resp
+
     async def log(
         self,
         *,
