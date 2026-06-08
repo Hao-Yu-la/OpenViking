@@ -462,7 +462,7 @@ class SyncOpenViking:
     @property
     def git(self) -> "SyncGitNamespace":
         """Git version control namespace (synchronous)."""
-        if not hasattr(self, "_git") or self._git is None:
+        if getattr(self, "_git", None) is None:
             from openviking.git_namespace import SyncGitNamespace
             self._git = SyncGitNamespace(self)
         return self._git

@@ -86,8 +86,6 @@ class AsyncOpenViking:
             await client.close()
         self._initialized = False
         self._singleton_initialized = False
-        # Clear any cached namespaces so they re-bind on next access.
-        self._git = None
 
     @classmethod
     async def reset(cls) -> None:
@@ -319,7 +317,7 @@ class AsyncOpenViking:
         Lazy-initialized on first access so importing the client does not
         pull in the git module when it's not needed.
         """
-        if not hasattr(self, "_git") or self._git is None:
+        if getattr(self, "_git", None) is None:
             from openviking.git_namespace import AsyncGitNamespace
             self._git = AsyncGitNamespace(self)
         return self._git
