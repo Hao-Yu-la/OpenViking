@@ -2664,3 +2664,298 @@ class VikingFS:
         except Exception as e:
             logger.error(f"[VikingFS] Failed to write {uri}: {e}")
             raise IOError(f"Failed to write {uri}: {e}")
+
+    # ------------------------------------------------------------------
+    # Git version control (commit / restore / show / log)
+    # ------------------------------------------------------------------
+
+    # First path segments that the Rust git enumerate.rs prunes from snapshots,
+    # plus the runtime lock name. Mirrors INTERNAL_FIRST_SEGMENTS in
+    # crates/ragfs/src/git/enumerate.rs and VikingFS._INTERNAL_NAMES so that
+    # callers fail fast in Python with a clear error rather than passing a
+    # path that the Rust side will silently drop.
+    _GIT_INTERNAL_FIRST_SEGMENTS = frozenset(
+        {"_system", "tasks", "temp", "queue", "upload", ".path.ovlock"}
+    )
+
+    _DEFAULT_GIT_AUTHOR_NAME = "viking-bot"
+    _DEFAULT_GIT_AUTHOR_EMAIL = "bot@viking.local"
+
+    def _uri_to_tree_path(self, uri: str, ctx: Optional[RequestContext] = None) -> str:
+        """Convert a viking:// URI to an account-relative git tree path.
+
+        ``viking://resources/proj_a/docs/a.md`` -> ``resources/proj_a/docs/a.md``.
+
+        Pure prefix stripping: removes the ``viking://`` scheme and any
+        ``/local/{account}/`` segment. Internal scopes that the Rust git layer
+        would prune (`_system`, `tasks`, `temp`, `queue`, `upload`) and the
+        runtime lock name (`.path.ovlock`) are rejected with ``ValueError``
+        — passing them through silently would result in a no-op commit and
+        confuse callers.
+        """
+        real_ctx = self._ctx_or_default(ctx)
+        canonical = canonicalize_uri(uri, real_ctx)
+        _, parts = self._normalized_uri_parts(canonical)
+        if not parts:
+            raise ValueError(
+                f"git tree path cannot be the account root: {uri!r}"
+            )
+        first = parts[0]
+        if first in self._GIT_INTERNAL_FIRST_SEGMENTS:
+            raise ValueError(
+                f"git tree path rejects internal scope/segment {first!r}: {uri!r}"
+            )
+        return "/".join(parts)
+
+    def _tree_path_to_uri(self, tree_path: str) -> str:
+        """Convert an account-relative git tree path to a viking:// URI.
+
+        Inverse of :py:meth:`_uri_to_tree_path` (without context canonicalization).
+        """
+        cleaned = tree_path.strip("/")
+        if not cleaned:
+            raise ValueError("tree path must not be empty")
+        return f"viking://{cleaned}"
+
+    _DERIVED_BASENAMES = frozenset({".abstract.md", ".overview.md", ".relations.json"})
+    _DERIVED_SIDECAR_SUFFIXES = (".abstract.md", ".overview.md")
+
+    def _reindex_uri_for_tree_path(self, tree_path: str) -> Optional[str]:
+        """Map a restore-affected tree path to the URI to hand ReindexExecutor.
+
+        Source files reindex themselves. Derived files — the directory-level
+        markers (``dir/.abstract.md``, ``dir/.overview.md``, ``dir/.relations.json``)
+        and per-file sidecars (``x.md.abstract.md``, ``x.md.overview.md``) —
+        redirect to the parent directory so the executor refreshes the
+        L0/L1 vectors from the (already-restored) on-disk content.
+
+        Returns ``None`` for paths that have no meaningful reindex target
+        (e.g. a derived file at the account root with no parent).
+        """
+        parent, _, name = tree_path.rpartition("/")
+        if name in self._DERIVED_BASENAMES:
+            target = parent
+        elif any(
+            name.endswith(s) and len(name) > len(s)
+            for s in self._DERIVED_SIDECAR_SUFFIXES
+        ):
+            target = parent
+        else:
+            target = tree_path
+        if not target:
+            return None
+        return self._tree_path_to_uri(target)
+
+    async def commit(
+        self,
+        *,
+        message: str,
+        paths: Optional[List[str]] = None,
+        branch: str = "main",
+        author_name: Optional[str] = None,
+        author_email: Optional[str] = None,
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict[str, Any]:
+        """Create a git snapshot of the account's tree.
+
+        Args:
+            message: Commit message.
+            paths: Optional list of ``viking://`` URIs to scope the commit to.
+                ``None`` (default) enumerates the whole account tree. An empty
+                list is forwarded as an explicit empty path list (no-op commit).
+            branch: Branch to advance. Defaults to ``"main"``.
+            author_name / author_email: Override the default bot author.
+            ctx: Request context (provides ``account_id``).
+
+        Returns:
+            Dict with ``result`` (``"created"`` / ``"noop"``) and ``commit_oid``;
+            ``changed`` count when ``result == "created"``.
+        """
+        real_ctx = self._ctx_or_default(ctx)
+        account = real_ctx.account_id
+        if paths is None:
+            tree_paths: Optional[List[str]] = None
+        else:
+            tree_paths = [self._uri_to_tree_path(p, ctx=real_ctx) for p in paths]
+        return await self._async_agfs.run(
+            "git_commit",
+            account=account,
+            branch=branch,
+            message=message,
+            paths=tree_paths,
+            author_name=author_name or self._DEFAULT_GIT_AUTHOR_NAME,
+            author_email=author_email or self._DEFAULT_GIT_AUTHOR_EMAIL,
+        )
+
+    async def restore(
+        self,
+        *,
+        project_dir: str,
+        source_commit: str,
+        branch: str = "main",
+        dry_run: bool = False,
+        message: Optional[str] = None,
+        author_name: Optional[str] = None,
+        author_email: Optional[str] = None,
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict[str, Any]:
+        """Restore a project subtree to the state at ``source_commit``.
+
+        Generates a new commit whose parent is the current HEAD (not the
+        source commit) and writes the diff through the VFS. Paths outside
+        ``project_dir`` are left untouched.
+
+        Args:
+            project_dir: ``viking://`` URI of the subtree, e.g.
+                ``"viking://resources/proj_a"``. May also be passed as a
+                short form like ``"resources/proj_a"``. Trailing slashes are
+                stripped. Internal scopes are rejected with ``ValueError``.
+            source_commit: 40-hex OID, branch name, or full ref path.
+            branch: Branch to advance. Defaults to ``"main"``.
+            dry_run: If True, returns the planned diff without writing.
+            message: Optional commit message; defaults to a generated string.
+            author_name / author_email: Override the default bot author.
+            ctx: Request context (provides ``account_id``).
+
+        Returns:
+            Dict containing ``result`` (``"applied"`` / ``"noop"`` / ``"dry_run"``)
+            and corresponding oid / diff fields.
+
+        After an ``Applied`` result, this method schedules background vector
+        index rebuilds for each non-derived written/deleted path using
+        :class:`ReindexExecutor`. Failures are logged and do not block the
+        return value.
+        """
+        real_ctx = self._ctx_or_default(ctx)
+        account = real_ctx.account_id
+        tree_dir = self._uri_to_tree_path(project_dir, ctx=real_ctx).rstrip("/")
+        if not tree_dir:
+            raise ValueError(f"project_dir must not be empty: {project_dir!r}")
+        result = await self._async_agfs.run(
+            "git_restore",
+            account=account,
+            branch=branch,
+            project_dir=tree_dir,
+            source_commit=source_commit,
+            dry_run=dry_run,
+            message=message,
+            author_name=author_name or self._DEFAULT_GIT_AUTHOR_NAME,
+            author_email=author_email or self._DEFAULT_GIT_AUTHOR_EMAIL,
+        )
+        if dry_run or result.get("result") != "applied":
+            return result
+
+        affected: List[str] = list(result.get("written_paths") or [])
+        affected.extend(result.get("deleted_paths") or [])
+        if affected:
+            self._schedule_vector_rebuild(affected, real_ctx)
+        return result
+
+    async def show(
+        self,
+        target_ref: str,
+        *,
+        path: Optional[str] = None,
+        ctx: Optional[RequestContext] = None,
+    ) -> Union[Dict[str, Any], bytes]:
+        """Read a commit's metadata or a single blob.
+
+        ``path=None`` returns the commit metadata dict (oid, tree, parents,
+        author, committer, message). ``path=str`` returns the blob bytes
+        directly, stripping the oid/size envelope returned by the binding.
+        """
+        real_ctx = self._ctx_or_default(ctx)
+        account = real_ctx.account_id
+        tree_path = self._uri_to_tree_path(path, ctx=real_ctx) if path else None
+        resp = await self._async_agfs.run(
+            "git_show",
+            account=account,
+            target_ref=target_ref,
+            path=tree_path,
+        )
+        if path is not None and isinstance(resp, dict) and "bytes" in resp:
+            return resp["bytes"]
+        return resp
+
+    async def log(
+        self,
+        *,
+        branch: str = "main",
+        limit: int = 20,
+        ctx: Optional[RequestContext] = None,
+    ) -> List[Dict[str, Any]]:
+        """Walk back from ``branch``'s HEAD along ``parents[0]`` up to ``limit`` commits.
+
+        Returns a list of commit metadata dicts (same shape as ``show(target_ref)``).
+        """
+        if limit <= 0:
+            return []
+        real_ctx = self._ctx_or_default(ctx)
+        account = real_ctx.account_id
+        head = await self._async_agfs.run(
+            "git_show", account=account, target_ref=branch, path=None,
+        )
+        results: List[Dict[str, Any]] = [head]
+        parents = head.get("parents") or []
+        while parents and len(results) < limit:
+            parent_oid = parents[0]
+            commit = await self._async_agfs.run(
+                "git_show", account=account, target_ref=parent_oid, path=None,
+            )
+            results.append(commit)
+            parents = commit.get("parents") or []
+        return results
+
+    def _schedule_vector_rebuild(
+        self, tree_paths: List[str], ctx: RequestContext
+    ) -> None:
+        """Fire-and-forget vector reindex for paths affected by a git restore.
+
+        Derived files (`.abstract.md` / `.overview.md` / `.relations.json` and
+        their per-file sidecars) are redirected to their parent directory so
+        the directory-level L0/L1 vectors get recomputed from the restored
+        on-disk content. Source files are reindexed directly. URIs are
+        deduplicated. Failures are logged and never propagate.
+        """
+        try:
+            from openviking.service.reindex_executor import ReindexExecutor
+        except Exception:
+            logger.exception("[VikingFS] ReindexExecutor import failed; skipping rebuild")
+            return
+
+        executor = ReindexExecutor()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "[VikingFS] git restore vector rebuild skipped: no running event loop"
+            )
+            return
+
+        seen: set[str] = set()
+        for tree_path in tree_paths:
+            try:
+                uri = self._reindex_uri_for_tree_path(tree_path)
+            except ValueError:
+                continue
+            if uri is None or uri in seen:
+                continue
+            seen.add(uri)
+            loop.create_task(
+                self._run_vector_rebuild(executor, uri, ctx),
+                name=f"vikingfs-git-reindex:{uri}",
+            )
+
+    async def _run_vector_rebuild(
+        self,
+        executor: Any,
+        uri: str,
+        ctx: RequestContext,
+    ) -> None:
+        """Wrapper coroutine: run ReindexExecutor and swallow errors."""
+        try:
+            await executor.execute(uri=uri, mode="vectors_only", wait=False, ctx=ctx)
+        except Exception:
+            logger.exception(
+                "[VikingFS] git restore vector rebuild failed for %s", uri
+            )

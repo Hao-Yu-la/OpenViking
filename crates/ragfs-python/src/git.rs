@@ -337,6 +337,8 @@ pub fn restore_response_to_pydict(
             written,
             deleted,
             unchanged,
+            written_paths,
+            deleted_paths,
         } => {
             d.set_item("result", "applied")?;
             d.set_item("new_commit_oid", oid_hex(&new_commit_oid))?;
@@ -345,6 +347,8 @@ pub fn restore_response_to_pydict(
             d.set_item("written", written)?;
             d.set_item("deleted", deleted)?;
             d.set_item("unchanged", unchanged)?;
+            d.set_item("written_paths", written_paths)?;
+            d.set_item("deleted_paths", deleted_paths)?;
         }
         RestoreResponse::Noop { head, source } => {
             d.set_item("result", "noop")?;

@@ -137,6 +137,13 @@ pub enum RestoreResponse {
         deleted: usize,
         /// Number of files left untouched because source/head agreed.
         unchanged: usize,
+        /// Account-relative paths (prefixed with `project_dir`) that were
+        /// written to the VFS. Lets callers trigger downstream side effects
+        /// (vector index rebuild, watcher notifications) without re-walking
+        /// the tree.
+        written_paths: Vec<String>,
+        /// Account-relative paths that were removed from the VFS.
+        deleted_paths: Vec<String>,
     },
     /// Source subtree byte-equal to head subtree — nothing to do. No new
     /// commit was created; the branch ref is unchanged.

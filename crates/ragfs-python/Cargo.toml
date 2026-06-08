@@ -8,15 +8,22 @@ publish = false
 
 [lib]
 name = "ragfs_python"
-crate-type = ["cdylib"]
+# rlib is needed so `cargo test` can build a test binary that links against
+# this crate's symbols. cdylib is what maturin packages as the Python .so.
+crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["s3"]
+# `extension-module` is on by default for `maturin build` / runtime use, where
+# the resulting .so is loaded by the Python interpreter and must NOT link
+# libpython. For `cargo test`, opt out with `--no-default-features` so the
+# test binary can resolve Python C symbols against libpython at link time.
+default = ["s3", "extension-module"]
 s3 = ["ragfs/s3"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 ragfs = { path = "../ragfs" }
-pyo3 = { version = "0.27", features = ["extension-module", "abi3", "abi3-py310"] }
+pyo3 = { version = "0.27", features = ["abi3", "abi3-py310"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"
 serde = { version = "1", features = ["derive"] }

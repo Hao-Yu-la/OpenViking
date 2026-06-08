@@ -475,6 +475,19 @@ impl GitService {
             Err(other) => return Err(other.into()),
         }
 
+        // Prefix diff paths with project_dir to produce account-relative paths.
+        let project_dir_ref = &project_dir;
+        let written_paths: Vec<String> = diff
+            .to_write
+            .iter()
+            .map(|(rel, _)| format!("{}/{}", project_dir_ref, rel))
+            .collect();
+        let deleted_paths: Vec<String> = diff
+            .to_delete
+            .iter()
+            .map(|rel| format!("{}/{}", project_dir_ref, rel))
+            .collect();
+
         Ok(RestoreResponse::Applied {
             new_commit_oid,
             source_commit: source_oid,
@@ -482,6 +495,8 @@ impl GitService {
             written: writes_planned,
             deleted: deletes_planned,
             unchanged: unchanged_count,
+            written_paths,
+            deleted_paths,
         })
     }
 }
@@ -1769,12 +1784,29 @@ mod tests {
                 written,
                 deleted,
                 unchanged,
+                written_paths,
+                deleted_paths,
             } => {
                 assert_eq!(source_commit, source_oid);
                 assert_eq!(parent_commit, head_oid, "parent MUST be HEAD, NOT source");
                 assert_eq!(written, 2, "a.md (rewrite) + b.md (recreate) = 2");
                 assert_eq!(deleted, 1, "c.md");
                 assert_eq!(unchanged, 0);
+                assert_eq!(written_paths.len(), 2);
+                assert_eq!(deleted_paths.len(), 1);
+                // Paths should be account-relative (project_dir-prefixed).
+                for p in &written_paths {
+                    assert!(
+                        p.starts_with("resources/proj_a/"),
+                        "written path missing project_dir prefix: {p}"
+                    );
+                }
+                for p in &deleted_paths {
+                    assert!(
+                        p.starts_with("resources/proj_a/"),
+                        "deleted path missing project_dir prefix: {p}"
+                    );
+                }
                 new_commit_oid
             }
             other => panic!("expected Applied, got {other:?}"),
