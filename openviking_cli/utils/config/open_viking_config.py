@@ -21,6 +21,7 @@ from .consts import (
 )
 from .embedding_config import EmbeddingConfig
 from .encryption_config import EncryptionConfig
+from .git_config import GitConfig
 from .log_config import LogConfig
 from .memory_config import MemoryConfig
 from .oauth_config import OAuthConfig
@@ -90,6 +91,11 @@ class OpenVikingConfig(BaseModel):
     # Encryption configuration
     encryption: EncryptionConfig = Field(
         default_factory=EncryptionConfig, description="Encryption configuration"
+    )
+
+    # Git version control configuration (opt-in)
+    git: GitConfig = Field(
+        default_factory=GitConfig, description="Git version control configuration"
     )
 
     # Parser configurations
