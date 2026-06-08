@@ -109,3 +109,23 @@ def test_git_enabled_with_empty_base_dir_defaults_to_storage_git(agfs_config, fa
     body = Path(fake_binding[0].kwargs["config_path"]).read_text()
     expected = str(Path(agfs_config.path).resolve() / "git")
     assert expected in body
+
+
+def test_git_enabled_escapes_special_chars_in_strings(agfs_config, fake_binding, tmp_path):
+    """Strings with backslashes / quotes round-trip into valid TOML."""
+    cfg = GitConfig(
+        enabled=True,
+        author_name='He said "hi"',
+        author_email='a\\b@x.com',
+        local=GitLocalConfig(base_dir=str(tmp_path / "git"), fsync="off"),
+    )
+    create_agfs_client(agfs_config, git_config=cfg)
+    body = Path(fake_binding[0].kwargs["config_path"]).read_text(encoding="utf-8")
+    # Parse it back with a real TOML parser to prove validity.
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # py<3.11
+    parsed = tomllib.loads(body)
+    assert parsed["git"]["author_name"] == 'He said "hi"'
+    assert parsed["git"]["author_email"] == 'a\\b@x.com'

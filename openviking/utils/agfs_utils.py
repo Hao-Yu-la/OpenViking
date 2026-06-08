@@ -142,6 +142,10 @@ def _render_git_toml(git_config: Any, storage_path: Path) -> str:
     (see tests/agfs/test_viking_fs_git.py). When ``git_config.local.base_dir`` is
     empty, it defaults to ``{storage_path}/git``.
     """
+    def _q(s: str) -> str:
+        # Escape backslash first, then double-quote, then wrap in quotes.
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
     local_cfg = getattr(git_config, "local", None)
     base_dir = getattr(local_cfg, "base_dir", "") if local_cfg is not None else ""
     if not base_dir:
@@ -159,14 +163,14 @@ def _render_git_toml(git_config: Any, storage_path: Path) -> str:
     return (
         "[git]\n"
         f"enabled = {enabled}\n"
-        f'backend = "{backend}"\n'
-        f'default_branch = "{default_branch}"\n'
-        f'author_name = "{author_name}"\n'
-        f'author_email = "{author_email}"\n'
+        f"backend = {_q(backend)}\n"
+        f"default_branch = {_q(default_branch)}\n"
+        f"author_name = {_q(author_name)}\n"
+        f"author_email = {_q(author_email)}\n"
         "\n"
         "[git.local]\n"
-        f'base_dir = "{base_dir}"\n'
-        f'fsync = "{fsync}"\n'
+        f"base_dir = {_q(base_dir)}\n"
+        f"fsync = {_q(fsync)}\n"
     )
 
 
@@ -209,7 +213,7 @@ def create_agfs_client(agfs_config: Any, *, git_config: Any = None) -> Any:
         runtime_dir = storage_path / ".runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         toml_path = runtime_dir / "ragfs.toml"
-        toml_path.write_text(_render_git_toml(git_config, storage_path))
+        toml_path.write_text(_render_git_toml(git_config, storage_path), encoding="utf-8")
         client = RAGFSBindingClient(config_path=str(toml_path))
     else:
         client = RAGFSBindingClient()
