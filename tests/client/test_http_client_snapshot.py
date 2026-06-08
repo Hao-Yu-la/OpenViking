@@ -130,3 +130,17 @@ async def test_git_show_blob_returns_envelope_from_headers():
     assert result == {"oid": "b" * 40, "size": 6, "bytes": b"hello\n"}
     call = fake.calls[-1]
     assert call["params"] == {"target_ref": "c" * 40, "path": "viking://resources/x.txt"}
+
+
+async def test_git_log_gets_with_params():
+    client, fake = _client_with_fake()
+    client._handle_response = lambda resp: [{"oid": "d" * 40, "message": "x"}]
+    fake.next_response = object()
+
+    result = await client.git_log(branch="main", limit=5)
+
+    assert result == [{"oid": "d" * 40, "message": "x"}]
+    call = fake.calls[-1]
+    assert call["method"] == "GET"
+    assert call["path"] == "/api/v1/snapshot/log"
+    assert call["params"] == {"branch": "main", "limit": 5}

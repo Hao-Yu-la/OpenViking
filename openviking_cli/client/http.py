@@ -1169,8 +1169,12 @@ class AsyncHTTPClient(BaseClient):
         branch: str = "main",
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Git operations require embedded mode."""
-        raise NotImplementedError("Git version control is only supported in embedded mode")
+        """Walk commit history newest-first."""
+        response = await self._http.get(
+            "/api/v1/snapshot/log",
+            params={"branch": branch, "limit": limit},
+        )
+        return self._handle_response(response)
 
     # ============= Debug =============
 
