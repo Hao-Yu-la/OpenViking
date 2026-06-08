@@ -381,6 +381,14 @@ class OpenVikingService:
             agfs_client=self._agfs_client,
         )
 
+        # Register as the process-wide service so flows that resolve the
+        # service via the dependency global (e.g. background reindex tasks
+        # triggered by git restore) work in embedded mode, not just under the
+        # HTTP server which calls set_service() during bootstrap.
+        from openviking.server.dependencies import set_service
+
+        set_service(self)
+
         self._initialized = True
         logger.info("OpenVikingService initialized")
 
@@ -416,6 +424,13 @@ class OpenVikingService:
         self._directory_initializer = None
         self._privacy_config_service = None
         self._initialized = False
+
+        # Clear the process-wide registration if it still points at us, so a
+        # closed service is never resolved via the dependency global.
+        from openviking.server.dependencies import get_service_or_none, set_service
+
+        if get_service_or_none() is self:
+            set_service(None)
 
         logger.info("OpenVikingService closed")
 

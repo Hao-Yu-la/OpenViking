@@ -2986,11 +2986,21 @@ class VikingFS:
             else:
                 file_uris.add(uri)
 
-        # Pass 2: drop any file URI strictly under a scheduled directory URI;
-        # the directory task already covers it.
-        effective: set[str] = set(dir_uris)
+        # Pass 2: reduce directory URIs to a minimal set by dropping any dir
+        # nested under another scheduled dir. The executor recurses through a
+        # directory's whole subtree, so an ancestor task already covers its
+        # descendants. Scheduling both would race for overlapping tree locks
+        # (the ancestor's descendant-lock scan blocks on the child's lock).
+        # URIs sort so that an ancestor always precedes its descendants.
+        minimal_dirs: set[str] = set()
+        for dir_uri in sorted(dir_uris):
+            if any(dir_uri.startswith(parent + "/") for parent in minimal_dirs):
+                continue
+            minimal_dirs.add(dir_uri)
+
+        effective: set[str] = set(minimal_dirs)
         for file_uri in file_uris:
-            if any(file_uri.startswith(d + "/") for d in dir_uris):
+            if any(file_uri.startswith(d + "/") for d in minimal_dirs):
                 continue
             effective.add(file_uri)
 
