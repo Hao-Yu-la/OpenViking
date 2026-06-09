@@ -1,3 +1,4 @@
+import tempfile, os
 import openviking as ov
 
 # Initialize OpenViking client with data directory
@@ -61,7 +62,6 @@ try:
     print(f"v1 commit: {v1['commit_oid'][:12]}  ({v1['result']})")
 
     # Add a second resource and snapshot v2
-    import tempfile, os
     notes_path = os.path.join(tempfile.mkdtemp(), "notes.md")
     with open(notes_path, "w") as f:
         f.write("# Notes\nA second document.\n")

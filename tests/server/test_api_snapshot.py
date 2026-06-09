@@ -140,3 +140,151 @@ async def test_show_path_not_found_returns_404(client_with_resource):
     )
     assert resp.status_code == 404
     assert resp.json()["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# restore (apply) — forward-commit chain + reindex hook + concurrent-commit 409
+# ---------------------------------------------------------------------------
+
+
+async def test_restore_apply_advances_head_with_forward_commit(client_with_resource_and_blob, service):
+    """End-to-end restore (dry_run=False) over HTTP: verify forward-commit
+    semantics — the new commit's parent is the previous HEAD, NOT the source
+    commit, and the workspace bytes match the source.
+    """
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+
+    client, c1_oid, blob_uri, v1_bytes = client_with_resource_and_blob
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+
+    # Overwrite the blob and commit a second snapshot (c2 becomes new HEAD).
+    v2_bytes = b"v2 modified content\n"
+    await service.viking_fs.write_file(blob_uri, v2_bytes, ctx=ctx)
+    c2_resp = await client.post("/api/v1/snapshot/commit", json={"message": "v2"})
+    assert c2_resp.status_code == 200, c2_resp.text
+    c2 = c2_resp.json()["result"]
+    assert c2["result"] == "created"
+    c2_oid = c2["commit_oid"]
+
+    # Apply restore back to c1 over the whole resources scope.
+    restore_resp = await client.post(
+        "/api/v1/snapshot/restore",
+        json={
+            "project_dir": "viking://resources",
+            "source_commit": c1_oid,
+        },
+    )
+    assert restore_resp.status_code == 200, restore_resp.text
+    body = restore_resp.json()
+    assert body["status"] == "ok"
+    result = body["result"]
+    assert result["result"] == "applied"
+    assert result["source_commit"] == c1_oid
+    assert result["parent_commit"] == c2_oid  # forward-commit: parent = old HEAD
+    new_oid = result["new_commit_oid"]
+    assert new_oid not in (c1_oid, c2_oid)
+
+    # HEAD must point at the new commit, whose parent[0] == c2 (NOT c1).
+    head_resp = await client.get("/api/v1/snapshot/show", params={"target_ref": "main"})
+    assert head_resp.status_code == 200
+    head = head_resp.json()["result"]
+    assert head["oid"] == new_oid
+    assert head["parents"] == [c2_oid]
+
+    # The blob in the restored commit must equal v1.
+    show_resp = await client.get(
+        "/api/v1/snapshot/show",
+        params={"target_ref": new_oid, "path": blob_uri},
+    )
+    assert show_resp.status_code == 200
+    assert show_resp.content == v1_bytes
+
+
+async def test_restore_apply_triggers_reindex_hook(client_with_resource_and_blob, service, monkeypatch):
+    """Verify the HTTP restore path actually invokes the vector-reindex
+    scheduler — protects the chain router -> viking_fs.restore -> _schedule_vector_rebuild.
+    """
+    from openviking.server.identity import RequestContext, Role
+    from openviking_cli.session.user_id import UserIdentifier
+    import openviking.service.reindex_executor as reindex_mod
+
+    client, c1_oid, blob_uri, _v1 = client_with_resource_and_blob
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+
+    calls: list[str] = []
+
+    class _SpyExecutor:
+        async def execute(self, *, uri, mode, wait, ctx):
+            calls.append(uri)
+            return {"ok": True}
+
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
+
+    # Mutate, commit v2, then restore back to c1 — must produce a reindex call.
+    await service.viking_fs.write_file(blob_uri, b"v2-bytes\n", ctx=ctx)
+    await client.post("/api/v1/snapshot/commit", json={"message": "v2"})
+
+    restore_resp = await client.post(
+        "/api/v1/snapshot/restore",
+        json={"project_dir": "viking://resources", "source_commit": c1_oid},
+    )
+    assert restore_resp.status_code == 200, restore_resp.text
+    assert restore_resp.json()["result"]["result"] == "applied"
+
+    # _schedule_vector_rebuild fires-and-forgets the executor task; give the
+    # event loop a couple of ticks to flush it.
+    import asyncio
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert calls, "expected at least one reindex call after restore apply"
+
+
+async def test_restore_concurrent_commit_returns_409(client_with_resource_and_blob, service, monkeypatch):
+    """Force the underlying git CAS swap to raise GitConcurrentCommitError
+    and verify the HTTP layer maps it to 409 with CONFLICT code.
+    """
+    from openviking.pyagfs.exceptions import GitConcurrentCommitError
+
+    client, c1_oid, _blob_uri, _v1 = client_with_resource_and_blob
+
+    async def _raise_conflict(self, *, message=None, **kwargs):
+        raise GitConcurrentCommitError("git ref refs/heads/main changed under us")
+
+    from openviking.storage.viking_fs import VikingFS
+
+    monkeypatch.setattr(VikingFS, "restore", _raise_conflict)
+
+    resp = await client.post(
+        "/api/v1/snapshot/restore",
+        json={"project_dir": "viking://resources", "source_commit": c1_oid},
+    )
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "CONFLICT"
+
+
+async def test_restore_rejects_unknown_field_per_pydantic_forbid(client_with_resource):
+    """Pydantic ConfigDict(extra='forbid') on RestoreRequest must reject typo'd fields.
+
+    The OpenViking error mapper rewrites FastAPI's default 422 into HTTP 400
+    with code INVALID_ARGUMENT — that's the contract callers see.
+    """
+    client, _ = client_with_resource
+    commit = (await client.post("/api/v1/snapshot/commit", json={"message": "v"})).json()["result"]
+    resp = await client.post(
+        "/api/v1/snapshot/restore",
+        json={
+            "project_dir": "viking://resources",
+            "source_commit": commit["commit_oid"],
+            "dryRun": True,  # typo: should be dry_run
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    # The offending field name must surface in the error so the user can fix it.
+    assert "dryRun" in body["error"]["message"]

@@ -179,19 +179,30 @@ fn handle_show(
             }
             Ok(())
         }
-        SnapshotShowResult::Blob { bytes, size, .. } => match out_path {
-            Some(path) => {
-                let mut f = std::fs::File::create(&path)?;
-                f.write_all(&bytes)?;
-                eprintln!("Wrote {} bytes to {}", size, path.display());
-                Ok(())
+        SnapshotShowResult::Blob { oid, bytes, size } => {
+            if matches!(output_format, OutputFormat::Json) {
+                let envelope = serde_json::json!({"oid": oid, "size": size});
+                output_success(&envelope, output_format, compact);
+                if let Some(path) = out_path {
+                    let mut f = std::fs::File::create(&path)?;
+                    f.write_all(&bytes)?;
+                }
+                return Ok(());
             }
-            None => {
-                let mut out = std::io::stdout().lock();
-                out.write_all(&bytes)?;
-                Ok(())
+            match out_path {
+                Some(path) => {
+                    let mut f = std::fs::File::create(&path)?;
+                    f.write_all(&bytes)?;
+                    eprintln!("Wrote {} bytes from {} to {}", size, &oid[..12.min(oid.len())], path.display());
+                }
+                None => {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(&bytes)?;
+                    eprintln!("Read {} bytes from {}", size, &oid[..12.min(oid.len())]);
+                }
             }
-        },
+            Ok(())
+        }
     }
 }
 

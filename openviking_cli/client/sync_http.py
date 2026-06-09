@@ -50,6 +50,7 @@ class SyncHTTPClient:
             profile_enabled=profile_enabled,
         )
         self._initialized = False
+        self._git: Optional["SyncHTTPGitNamespace"] = None
 
     # ============= Lifecycle =============
 
@@ -574,7 +575,7 @@ class SyncHTTPClient:
     @property
     def git(self) -> "SyncHTTPGitNamespace":
         """Git version control namespace (sync HTTP)."""
-        if getattr(self, "_git", None) is None:
+        if self._git is None:
             from openviking.git_namespace import SyncHTTPGitNamespace
             self._git = SyncHTTPGitNamespace(self)
         return self._git

@@ -132,6 +132,56 @@ async def test_git_show_blob_returns_envelope_from_headers():
     assert call["params"] == {"target_ref": "c" * 40, "path": "viking://resources/x.txt"}
 
 
+async def test_git_show_blob_handles_case_insensitive_headers():
+    """A real httpx.Response uses case-insensitive headers (httpx.Headers).
+    Confirm the client reads x-snapshot-* correctly even when the server
+    capitalises them (FastAPI may send X-Snapshot-Oid as-is).
+    """
+    import httpx
+
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    fake = _FakeHTTPClient()
+    client._http = fake
+
+    class _CaseyResponse:
+        def __init__(self, content: bytes, oid: str, size: int):
+            self.content = content
+            self.status_code = 200
+            self.headers = httpx.Headers(
+                {
+                    "Content-Type": "application/octet-stream",
+                    "X-Snapshot-Oid": oid,
+                    "X-Snapshot-Size": str(size),
+                }
+            )
+
+    fake.next_response = _CaseyResponse(b"\x00\x01\x02", oid="e" * 40, size=3)
+    result = await client.git_show(target_ref="ref", path="viking://resources/bin.dat")
+    assert result == {"oid": "e" * 40, "size": 3, "bytes": b"\x00\x01\x02"}
+
+
+async def test_git_show_blob_missing_headers_degrades_gracefully():
+    """Server bug / proxy strip: headers absent but content-type still binary.
+    Client must not crash — empty oid and size=0 are acceptable fallbacks
+    (the byte payload is what matters for the caller).
+    """
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    fake = _FakeHTTPClient()
+    client._http = fake
+
+    class _NoHeadersResponse:
+        def __init__(self, content: bytes):
+            self.content = content
+            self.status_code = 200
+            self.headers = {"content-type": "application/octet-stream"}
+
+    fake.next_response = _NoHeadersResponse(b"payload")
+    result = await client.git_show(target_ref="r", path="viking://resources/x")
+    assert result["bytes"] == b"payload"
+    assert result["oid"] == ""
+    assert result["size"] == 0
+
+
 async def test_git_log_gets_with_params():
     client, fake = _client_with_fake()
     client._handle_response = lambda resp: [{"oid": "d" * 40, "message": "x"}]

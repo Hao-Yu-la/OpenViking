@@ -224,6 +224,7 @@ class AsyncHTTPClient(BaseClient):
             params={"profile": "1"} if self._profile_enabled else None,
         )
         self._observer = _HTTPObserver(self)
+        self._git: Optional["AsyncHTTPGitNamespace"] = None
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -1355,7 +1356,7 @@ class AsyncHTTPClient(BaseClient):
     @property
     def git(self) -> "AsyncHTTPGitNamespace":
         """Git version control namespace (async HTTP)."""
-        if getattr(self, "_git", None) is None:
+        if self._git is None:
             from openviking.git_namespace import AsyncHTTPGitNamespace
             self._git = AsyncHTTPGitNamespace(self)
         return self._git

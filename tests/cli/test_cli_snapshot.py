@@ -162,6 +162,60 @@ class TestSnapshotShow:
             f"out-file bytes ({len(contents)} bytes) should match canonical "
             f"({len(expected_bytes)} bytes)"
         )
+        # Stderr summary must report bytes + oid + path (the fix added the oid).
+        assert (
+            "Wrote" in r["stderr"]
+            and "bytes from" in r["stderr"]
+            and oid[:12] in r["stderr"]
+            and str(out_path) in r["stderr"]
+        ), f"missing stderr summary, got: {r['stderr'][:300]}"
+
+    def test_show_blob_stdout_byte_exact_via_subprocess(self, test_file_uri, tmp_path):
+        """Run `snapshot show --path X` without --out-file and capture raw
+        bytes — must match the file content exactly (no UTF-8 decoding, no
+        trailing-newline tolerance). The `ov()` helper decodes as text and
+        strips, which hides binary-mangling bugs.
+        """
+        import subprocess
+        from conftest import CLI_BIN, _env, _inject_global_args
+
+        commit = _commit(f"show-stdout-bytes setup {uuid.uuid4().hex[:6]}")
+        oid = commit["commit_oid"]
+
+        canonical_path = tmp_path / "canonical.bin"
+        r_get = ov(
+            ["get", test_file_uri, str(canonical_path), "-o", "json"], timeout=60
+        )
+        assert r_get["exit_code"] == 0, f"get failed: {r_get['stderr'][:300]}"
+        expected_bytes = canonical_path.read_bytes()
+
+        # Run the CLI ourselves so we can capture stdout as bytes.
+        args = _inject_global_args(["snapshot", "show", oid, "--path", test_file_uri])
+        proc = subprocess.run(
+            [CLI_BIN] + args,
+            capture_output=True,
+            timeout=60,
+            env=_env(),
+        )
+        assert proc.returncode == 0, (
+            f"snapshot show stdout exit={proc.returncode}, "
+            f"stderr={proc.stderr.decode('utf-8', errors='replace')[:300]}"
+        )
+
+        # The CLI's echo_command prefix may land on stdout. Bytes must
+        # END with the canonical payload (no decoding, no rstrip).
+        assert proc.stdout.endswith(expected_bytes), (
+            f"snapshot show stdout did not end with canonical bytes; "
+            f"got tail (hex): {proc.stdout[-64:].hex()} vs "
+            f"expected tail (hex): {expected_bytes[-64:].hex()}"
+        )
+
+        # And the stderr summary line ("Read N bytes from <oid>") must be present —
+        # this is the user-visible signal that bytes flowed.
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")
+        assert "Read" in stderr_text and "bytes from" in stderr_text and oid[:12] in stderr_text, (
+            f"expected stderr summary 'Read N bytes from {oid[:12]}', got: {stderr_text[:300]}"
+        )
 
 
 class TestSnapshotRestore:

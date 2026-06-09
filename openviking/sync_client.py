@@ -25,6 +25,7 @@ class SyncOpenViking:
     def __init__(self, path: Optional[str] = None):
         self._async_client = AsyncOpenViking(path=path)
         self._initialized = False
+        self._git: Optional["SyncGitNamespace"] = None
 
     def initialize(self) -> None:
         """Initialize OpenViking storage and indexes."""
@@ -462,7 +463,7 @@ class SyncOpenViking:
     @property
     def git(self) -> "SyncGitNamespace":
         """Git version control namespace (synchronous)."""
-        if getattr(self, "_git", None) is None:
+        if self._git is None:
             from openviking.git_namespace import SyncGitNamespace
             self._git = SyncGitNamespace(self)
         return self._git
