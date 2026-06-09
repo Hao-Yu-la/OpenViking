@@ -2,9 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """CLI snapshot (git version control) tests."""
 
-import json
-import os
-import tempfile
+import re
 import time
 import uuid
 
@@ -45,36 +43,35 @@ class TestSnapshotCommit:
         msg = f"cli-test human {uuid.uuid4().hex[:6]}"
         r = ov(["snapshot", "commit", "-m", msg], timeout=120)
         assert r["exit_code"] == 0, f"snapshot commit failed: {r['stderr'][:300]}"
-        # Either "Created <12-char-hex> (N files changed)" or "No changes" or just the oid
         out = r["stdout"]
-        assert (
-            "Created" in out
-            or "No changes" in out
-            or any(c in "0123456789abcdef" for c in out[:1])
+        assert re.match(
+            r"^(Created [0-9a-f]{12}|No changes)", out
         ), f"unexpected commit stdout: {out[:200]}"
 
 
 class TestSnapshotLog:
     def test_log_lists_commits(self, test_pack_uri):
-        # Establish baseline count
         r_before = ov(["snapshot", "log", "--limit", "100"], timeout=60)
         assert r_before["exit_code"] == 0
         before_lines = [ln for ln in r_before["stdout"].splitlines() if ln.strip()]
 
-        _commit(f"log-test setup {uuid.uuid4().hex[:6]}")
+        commit = _commit(f"log-test setup {uuid.uuid4().hex[:6]}")
+        short_oid = commit["commit_oid"][:12]
 
         r_after = ov(["snapshot", "log", "--limit", "100"], timeout=60)
         assert r_after["exit_code"] == 0
         after_lines = [ln for ln in r_after["stdout"].splitlines() if ln.strip()]
 
-        # New commit should add exactly one row (or the commit was a noop, in which case
-        # the count is unchanged — accept both since the snapshot may already be at HEAD).
-        assert len(after_lines) >= len(before_lines), (
-            f"log row count should not decrease: {len(before_lines)} -> {len(after_lines)}"
+        # The new commit's short oid must appear in the log, proving log reflects HEAD.
+        assert any(short_oid in ln for ln in after_lines), (
+            f"new commit {short_oid} should appear in log; "
+            f"first few lines: {after_lines[:3]}"
         )
-        assert len(after_lines) - len(before_lines) <= 1, (
-            f"a single commit should add at most one row, got delta "
-            f"{len(after_lines) - len(before_lines)}"
+        # A single commit should add at most one row (noop commits add zero).
+        delta = len(after_lines) - len(before_lines)
+        assert 0 <= delta <= 1, (
+            f"expected log delta of 0 or 1 after one commit, got {delta} "
+            f"(before={len(before_lines)}, after={len(after_lines)})"
         )
 
     def test_log_json_returns_array(self, test_pack_uri):
@@ -102,29 +99,48 @@ class TestSnapshotShow:
         assert meta.get("oid") == oid or meta.get("oid", "").startswith(oid[:12])
         assert "tree" in meta and "author" in meta
 
-    def test_show_blob_to_stdout(self, test_file_uri):
+    def test_show_blob_to_stdout(self, test_file_uri, tmp_path):
         commit = _commit(f"show-stdout setup {uuid.uuid4().hex[:6]}")
         oid = commit["commit_oid"]
-        # Canonical content via `read`
-        r_read = ov(["read", test_file_uri, "-o", "json"], timeout=60)
-        assert r_read["exit_code"] == 0
-        expected = r_read["stdout"]
+
+        # Capture canonical bytes via `get` (writes the file directly — no shell echo
+        # framing).
+        canonical_path = tmp_path / "canonical.bin"
+        r_get = ov(
+            ["get", test_file_uri, str(canonical_path), "-o", "json"],
+            timeout=60,
+        )
+        assert r_get["exit_code"] == 0, f"get failed: {r_get['stderr'][:300]}"
+        expected_bytes = canonical_path.read_bytes()
 
         r_show = ov(["snapshot", "show", oid, "--path", test_file_uri], timeout=60)
         assert r_show["exit_code"] == 0, f"snapshot show failed: {r_show['stderr'][:300]}"
-        # Both should contain the same file body. We compare a substring to avoid
-        # framing differences (echo command line, trailing newlines stripped by ov()).
-        snippet = "CLI Test"  # known content from conftest test_pack_uri fixture
-        assert snippet in r_show["stdout"], (
-            f"expected {snippet!r} in show stdout, got: {r_show['stdout'][:200]}"
-        )
-        assert snippet in expected, (
-            f"sanity check failed: snippet not in canonical read output: {expected[:200]}"
+
+        # `ov()` returns stdout as a stripped str; the CLI's `echo_command=True` may
+        # prepend the command line. Locate the blob body by suffix match: stdout must
+        # end with the file's content (with the encoding `ov()` used to decode bytes).
+        try:
+            expected_text = expected_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            pytest.skip("fixture content is not utf-8; this test assumes a text blob")
+        assert r_show["stdout"].endswith(expected_text.rstrip()), (
+            f"snapshot show stdout did not end with canonical blob content; "
+            f"tail of show stdout: {r_show['stdout'][-200:]!r} vs "
+            f"expected tail: {expected_text[-200:]!r}"
         )
 
     def test_show_blob_to_file(self, test_file_uri, tmp_path):
         commit = _commit(f"show-blob setup {uuid.uuid4().hex[:6]}")
         oid = commit["commit_oid"]
+
+        canonical_path = tmp_path / "canonical.bin"
+        r_get = ov(
+            ["get", test_file_uri, str(canonical_path), "-o", "json"],
+            timeout=60,
+        )
+        assert r_get["exit_code"] == 0, f"get failed: {r_get['stderr'][:300]}"
+        expected_bytes = canonical_path.read_bytes()
+
         out_path = tmp_path / "blob.bin"
         r = ov(
             [
@@ -142,13 +158,9 @@ class TestSnapshotShow:
         assert out_path.exists(), f"out-file {out_path} should exist"
 
         contents = out_path.read_bytes()
-        assert len(contents) > 0, "out-file should be non-empty"
-        # Verify the file content matches the canonical file (cross-check via `read`)
-        r_read = ov(["read", test_file_uri, "-o", "json"], timeout=60)
-        assert r_read["exit_code"] == 0
-        # The known fixture content includes "CLI Test"
-        assert b"CLI Test" in contents, (
-            f"expected 'CLI Test' bytes in out-file, got: {contents[:200]!r}"
+        assert contents == expected_bytes, (
+            f"out-file bytes ({len(contents)} bytes) should match canonical "
+            f"({len(expected_bytes)} bytes)"
         )
 
 
