@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0
 """End-to-end parity tests for client.git.* over HTTP.
 
-These exercise the same OpenViking.git namespace surface that
-tests/client/test_git_versioning.py covers for LocalClient, but routed
-through AsyncHTTPClient -> real FastAPI server (via httpx ASGITransport)
--> real OpenVikingService -> real VikingFS.
+These exercise the AsyncHTTPClient.git namespace surface that mirrors
+the LocalClient.git surface covered by tests/client/test_git_versioning.py,
+routed through AsyncHTTPClient -> real FastAPI server (via httpx
+ASGITransport) -> real OpenVikingService -> real VikingFS.
 
 The full stack is genuine: real httpx response parsing, real envelope
 handling, real X-Snapshot-* header round-tripping. No mocks at the
@@ -17,9 +17,8 @@ from __future__ import annotations
 import re
 import shutil
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator, Tuple
+from typing import AsyncGenerator
 
 import httpx
 import pytest
@@ -27,8 +26,6 @@ import pytest_asyncio
 
 ragfs_python = pytest.importorskip("ragfs_python")
 
-from openviking import AsyncOpenViking
-from openviking.git_namespace import AsyncGitNamespace
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
 from openviking.server.app import create_app
 from openviking.server.config import ServerConfig
@@ -92,7 +89,6 @@ def http_temp_dir():
 @pytest_asyncio.fixture(scope="function")
 async def http_service(http_temp_dir: Path, monkeypatch):
     """Stand up a real OpenVikingService backed by a temp data dir."""
-    await AsyncOpenViking.reset()
     reset_lock_manager()
     fake_embedder_cls = _install_fake_embedder(monkeypatch)
     _install_fake_vlm(monkeypatch)
@@ -104,7 +100,6 @@ async def http_service(http_temp_dir: Path, monkeypatch):
     await svc.initialize()
     svc.viking_fs.query_embedder = fake_embedder_cls()
 
-    # Provision account / user filesystem roots so git commits land somewhere.
     test_ctx = RequestContext(
         user=UserIdentifier("git_http_test_account", "git_http_test_user"),
         role=Role.ADMIN,
@@ -116,7 +111,6 @@ async def http_service(http_temp_dir: Path, monkeypatch):
     finally:
         await svc.close()
         reset_lock_manager()
-        await AsyncOpenViking.reset()
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -126,20 +120,16 @@ async def http_app(http_service: OpenVikingService):
 
     config = ServerConfig()
     app = create_app(config=config, service=http_service)
-    # ASGITransport doesn't trigger lifespan, so wire the service manually.
     set_service(http_service)
     return app
 
 
 @pytest_asyncio.fixture(scope="function")
-async def http_git_client(
-    http_app,
-) -> AsyncGenerator[Tuple[AsyncHTTPClient, AsyncGitNamespace], None]:
-    """Build a real AsyncHTTPClient whose underlying httpx talks to the ASGI app.
+async def http_git_client(http_app) -> AsyncGenerator[AsyncHTTPClient, None]:
+    """Real AsyncHTTPClient whose underlying httpx talks to the ASGI app.
 
-    The returned client exposes git_* methods used by AsyncGitNamespace just
-    like a production client pointed at a uvicorn server. The only swap is
-    the transport — every other layer is the real stack.
+    The returned client exposes the production `.git` namespace; the only
+    swap is the transport — every other layer is the real stack.
     """
     client = AsyncHTTPClient(
         url="http://testserver",
@@ -159,25 +149,10 @@ async def http_git_client(
         headers=headers,
         timeout=30.0,
     )
-
-    # Stand up the AsyncOpenViking shim so AsyncGitNamespace can resolve
-    # self._client._client.git_* (the namespace dereferences both layers).
-    async_client = object.__new__(AsyncOpenViking)
-    async_client._client = client
-    async_client._initialized = True
-    async_client._singleton_initialized = True
-    async_client._git = None
-
-    namespace = AsyncGitNamespace(async_client)
     try:
-        yield client, namespace
+        yield client
     finally:
         await client._http.aclose()
-
-
-# ----------------------------------------------------------------------
-# Shared helper: ensure a known blob exists in the workspace before tests
-# ----------------------------------------------------------------------
 
 
 async def _write_blob(service: OpenVikingService, uri: str, body: bytes) -> None:
@@ -188,36 +163,31 @@ async def _write_blob(service: OpenVikingService, uri: str, body: bytes) -> None
     await service.viking_fs.write_file(uri, body, ctx=ctx)
 
 
-# ----------------------------------------------------------------------
-# Parity tests
-# ----------------------------------------------------------------------
-
-
 async def test_http_commit_and_log_roundtrip(http_git_client, http_service):
-    _client, git = http_git_client
+    client = http_git_client
 
     await _write_blob(http_service, "viking://resources/http_a.md", b"hello-http")
 
-    commit = await git.commit(message="http parity")
+    commit = await client.git.commit(message="http parity")
     assert commit["result"] in ("created", "noop")
     assert isinstance(commit["commit_oid"], str)
     assert OID_RE.match(commit["commit_oid"])
 
-    log = await git.log(limit=5)
+    log = await client.git.log(limit=5)
     assert isinstance(log, list) and len(log) >= 1
     assert "oid" in log[0] and "message" in log[0]
 
 
 async def test_http_show_blob_byte_exact_roundtrip(http_git_client, http_service):
-    _client, git = http_git_client
+    client = http_git_client
     blob_uri = "viking://resources/http_show_blob.txt"
     expected = b"byte exact \x00\x01\x02 payload\n"
 
     await _write_blob(http_service, blob_uri, expected)
-    commit = await git.commit(message="with blob")
+    commit = await client.git.commit(message="with blob")
     assert OID_RE.match(commit["commit_oid"])
 
-    result = await git.show(commit["commit_oid"], path=blob_uri)
+    result = await client.git.show(commit["commit_oid"], path=blob_uri)
     assert isinstance(result, dict)
     assert result["bytes"] == expected
     assert result["size"] == len(expected)
@@ -225,43 +195,40 @@ async def test_http_show_blob_byte_exact_roundtrip(http_git_client, http_service
 
 
 async def test_http_show_metadata_without_path(http_git_client, http_service):
-    _client, git = http_git_client
+    client = http_git_client
 
     await _write_blob(http_service, "viking://resources/http_meta.md", b"metadata")
-    commit = await git.commit(message="meta commit")
+    commit = await client.git.commit(message="meta commit")
 
-    meta = await git.show(commit["commit_oid"])
+    meta = await client.git.show(commit["commit_oid"])
     assert meta["oid"] == commit["commit_oid"]
     assert meta["message"].startswith("meta commit")
     assert meta["parents"] == []
 
 
 async def test_http_restore_dry_run_does_not_mutate(http_git_client, http_service):
-    _client, git = http_git_client
+    client = http_git_client
 
     await _write_blob(http_service, "viking://resources/proj/a.md", b"v1")
-    v1 = await git.commit(message="v1")
+    v1 = await client.git.commit(message="v1")
     assert OID_RE.match(v1["commit_oid"])
 
     await _write_blob(http_service, "viking://resources/proj/a.md", b"v2")
-    v2 = await git.commit(message="v2")
+    v2 = await client.git.commit(message="v2")
     assert v2["commit_oid"] != v1["commit_oid"]
 
-    log_before = await git.log(limit=10)
+    log_before = await client.git.log(limit=10)
 
-    dry = await git.restore(
+    dry = await client.git.restore(
         project_dir="viking://resources/proj",
         source_commit=v1["commit_oid"],
         dry_run=True,
     )
 
-    # Per VikingFS.restore contract, dry_run returns either a diff payload or noop.
     assert "diff" in dry or dry.get("result") == "noop"
 
-    # Filesystem must be unchanged: HEAD blob still v2.
-    blob_after = await git.show(v2["commit_oid"], path="viking://resources/proj/a.md")
+    blob_after = await client.git.show(v2["commit_oid"], path="viking://resources/proj/a.md")
     assert blob_after["bytes"] == b"v2"
 
-    # Log length unchanged: dry-run does not advance HEAD.
-    log_after = await git.log(limit=10)
+    log_after = await client.git.log(limit=10)
     assert len(log_after) == len(log_before)

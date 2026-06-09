@@ -570,3 +570,11 @@ class SyncHTTPClient:
     def observer(self):
         """Get observer service for component status."""
         return self._async_client.observer
+
+    @property
+    def git(self) -> "SyncHTTPGitNamespace":
+        """Git version control namespace (sync HTTP)."""
+        if getattr(self, "_git", None) is None:
+            from openviking.git_namespace import SyncHTTPGitNamespace
+            self._git = SyncHTTPGitNamespace(self)
+        return self._git
