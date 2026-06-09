@@ -447,6 +447,46 @@ impl GitService {
             .try_collect::<()>()
             .await?;
 
+        // 6b. Prune directories left empty by the deletes above. Git does not
+        //     track directories, so `to_delete` only ever lists files; removing
+        //     the last file in a directory would otherwise leave an empty husk
+        //     in the VFS. Walk each deleted file's ancestor directories (within
+        //     project_dir, deepest first) and drop any that are now empty.
+        //     Best-effort: a directory that still holds entries, or has already
+        //     vanished, is simply skipped — pruning never aborts the restore.
+        use std::collections::BTreeSet;
+        // (depth, rel_dir): BTreeSet iterates ascending, so reversing yields the
+        // deepest directories first — children are pruned before their parents,
+        // letting a parent that held only pruned subdirs be removed in turn.
+        let mut prune_candidates: BTreeSet<(usize, String)> = BTreeSet::new();
+        for rel in &diff.to_delete {
+            let mut dir = rel.as_str();
+            while let Some(idx) = dir.rfind('/') {
+                dir = &dir[..idx];
+                prune_candidates.insert((dir.split('/').count(), dir.to_string()));
+            }
+        }
+        for (_depth, rel_dir) in prune_candidates.into_iter().rev() {
+            let abs = format!("{}/{}", abs_prefix, rel_dir);
+            let is_empty = match crate::core::filesystem::FileSystem::read_dir(
+                self.vfs.as_ref(),
+                &abs,
+            )
+            .await
+            {
+                Ok(entries) => entries.is_empty(),
+                // Missing or not a directory → nothing to prune.
+                Err(_) => false,
+            };
+            if is_empty {
+                // Ignore failures: a concurrent writer may have repopulated the
+                // directory, or it may already be gone. Either way the restore
+                // itself has succeeded.
+                let _ =
+                    crate::core::filesystem::FileSystem::remove(self.vfs.as_ref(), &abs).await;
+            }
+        }
+
         // 7. Build the new tree: load head.tree into an editor and splice
         //    source_subtree at project_dir.
         let mut editor = crate::git::tree_builder::TreeEditor::from_tree(
@@ -2038,6 +2078,85 @@ mod tests {
         assert!(
             !files.contains_key("/local/acct/resources/proj_a/c.md"),
             "c.md deleted",
+        );
+    }
+
+    // Regression: restoring to a revision where a whole subdirectory's files
+    // are gone must not leave an empty directory husk behind. Git does not
+    // track directories, so the delete diff only lists files — restore is
+    // responsible for pruning directories emptied by those deletes.
+    //
+    // Backed by a real `LocalFileSystem`: the in-memory `MockVfs` models
+    // directories implicitly (deleting the last file makes the dir vanish for
+    // free) and so cannot reproduce the husk. LocalFS keeps the directory on
+    // disk, exactly like production, which is what makes this test meaningful.
+    #[tokio::test]
+    async fn test_restore_prunes_directories_emptied_by_delete() {
+        use crate::plugins::localfs::LocalFileSystem;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(store_dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(store_dir.path()));
+
+        // Working tree root: /local/acct lives under this temp dir.
+        let work_dir = tempfile::tempdir().unwrap();
+        let acct_root = work_dir.path().join("local").join("acct");
+        std::fs::create_dir_all(&acct_root).unwrap();
+        let vfs: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(work_dir.path().to_str().unwrap()).unwrap());
+
+        let svc = GitService::new(vfs.clone(), object_store.clone(), ref_store.clone());
+
+        // Source commit: keeper.md at the project root only.
+        std::fs::create_dir_all(acct_root.join("resources/proj_a")).unwrap();
+        std::fs::write(acct_root.join("resources/proj_a/keeper.md"), b"keep").unwrap();
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        // HEAD adds a nested subdir whose only files restore will delete.
+        std::fs::create_dir_all(acct_root.join("resources/proj_a/nested/deep")).unwrap();
+        std::fs::write(acct_root.join("resources/proj_a/nested/x.md"), b"x").unwrap();
+        std::fs::write(acct_root.join("resources/proj_a/nested/deep/y.md"), b"y").unwrap();
+        let _head_oid = make_commit(&svc, "acct", "main", "head").await;
+
+        svc.restore(RestoreRequest {
+            account: "acct".into(),
+            branch: "main".into(),
+            project_dir: "resources/proj_a".into(),
+            source_commit: source_oid.to_hex().to_string(),
+            dry_run: false,
+            message: Some("rewind".into()),
+            author_name: "tester".into(),
+            author_email: "tester@example.com".into(),
+        })
+        .await
+        .unwrap();
+
+        // Files are gone, and so are the now-empty directories that held them
+        // (deepest first: deep/, then nested/).
+        assert!(
+            !acct_root.join("resources/proj_a/nested/deep/y.md").exists(),
+            "nested/deep/y.md must be deleted",
+        );
+        assert!(
+            !acct_root.join("resources/proj_a/nested/x.md").exists(),
+            "nested/x.md must be deleted",
+        );
+        assert!(
+            !acct_root.join("resources/proj_a/nested/deep").exists(),
+            "emptied directory nested/deep must be pruned",
+        );
+        assert!(
+            !acct_root.join("resources/proj_a/nested").exists(),
+            "emptied directory nested must be pruned",
+        );
+        // The surviving file and its (non-empty) parent are untouched.
+        assert!(
+            acct_root.join("resources/proj_a/keeper.md").exists(),
+            "keeper.md must survive",
+        );
+        assert!(
+            acct_root.join("resources/proj_a").is_dir(),
+            "project_dir itself must remain (still holds keeper.md)",
         );
     }
 
