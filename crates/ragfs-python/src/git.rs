@@ -170,6 +170,8 @@ pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
         GitError::RefStore(RefStoreError::Conflict { .. }) => {
             new_py_err_pub(py, "GitConcurrentCommitError", msg)
         }
+        GitError::OidPrefixNotFound { .. } => new_py_err_pub(py, "AGFSNotFoundError", msg),
+        GitError::AmbiguousOid { .. } => new_py_err_pub(py, "AGFSInvalidOperationError", msg),
         GitError::ObjectStore(ObjectStoreError::NotFound(_)) => {
             new_py_err_pub(py, "AGFSNotFoundError", msg)
         }

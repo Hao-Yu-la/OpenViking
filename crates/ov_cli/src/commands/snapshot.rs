@@ -80,11 +80,10 @@ fn print_commit(value: &Value, output_format: OutputFormat, compact: bool) {
     // value is already the "result" field from {status, result}.
     let result_kind = value.get("result").and_then(|v| v.as_str()).unwrap_or("");
     let oid = value.get("commit_oid").and_then(|v| v.as_str()).unwrap_or("");
-    let short = oid.get(..12).unwrap_or(oid);
     match result_kind {
         "created" => {
             let changed = value.get("changed").and_then(|v| v.as_u64()).unwrap_or(0);
-            println!("Created {} ({} files changed)", short, changed);
+            println!("Created {} ({} files changed)", oid, changed);
         }
         "noop" => println!("No changes — nothing to commit"),
         _ => println!("{}", oid),

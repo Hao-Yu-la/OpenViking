@@ -162,11 +162,14 @@ class TestSnapshotShow:
             f"out-file bytes ({len(contents)} bytes) should match canonical "
             f"({len(expected_bytes)} bytes)"
         )
-        # Stderr summary must report bytes + oid + path (the fix added the oid).
+        # Stderr summary must report bytes + blob-oid + path.
+        # Note: the oid in the summary is the *blob* oid (from X-Snapshot-Oid),
+        # not the commit oid.
+        import re as _re
         assert (
             "Wrote" in r["stderr"]
             and "bytes from" in r["stderr"]
-            and oid[:12] in r["stderr"]
+            and _re.search(r"from [0-9a-f]{7,}", r["stderr"])
             and str(out_path) in r["stderr"]
         ), f"missing stderr summary, got: {r['stderr'][:300]}"
 
@@ -210,12 +213,17 @@ class TestSnapshotShow:
             f"expected tail (hex): {expected_bytes[-64:].hex()}"
         )
 
-        # And the stderr summary line ("Read N bytes from <oid>") must be present —
-        # this is the user-visible signal that bytes flowed.
+        # The stderr summary line ("Read N bytes from <blob-oid>") must be
+        # present — this is the user-visible signal that bytes flowed.
+        # The oid in the summary is the blob oid (X-Snapshot-Oid), not the
+        # commit oid we asked about.
+        import re as _re
         stderr_text = proc.stderr.decode("utf-8", errors="replace")
-        assert "Read" in stderr_text and "bytes from" in stderr_text and oid[:12] in stderr_text, (
-            f"expected stderr summary 'Read N bytes from {oid[:12]}', got: {stderr_text[:300]}"
-        )
+        assert (
+            "Read" in stderr_text
+            and "bytes from" in stderr_text
+            and _re.search(r"from [0-9a-f]{7,}", stderr_text)
+        ), f"expected stderr summary 'Read N bytes from <blob-oid>', got: {stderr_text[:300]}"
 
 
 class TestSnapshotRestore:

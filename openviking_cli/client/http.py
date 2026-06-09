@@ -203,6 +203,7 @@ class AsyncHTTPClient(BaseClient):
             self._upload_mode = cli_config.upload.mode
         self._http: Optional[httpx.AsyncClient] = None
         self._observer: Optional[_HTTPObserver] = None
+        self._git: Optional["AsyncHTTPGitNamespace"] = None
 
     # ============= Lifecycle =============
 
@@ -224,7 +225,6 @@ class AsyncHTTPClient(BaseClient):
             params={"profile": "1"} if self._profile_enabled else None,
         )
         self._observer = _HTTPObserver(self)
-        self._git: Optional["AsyncHTTPGitNamespace"] = None
 
     async def close(self) -> None:
         """Close the HTTP client."""

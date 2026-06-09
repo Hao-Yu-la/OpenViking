@@ -12,7 +12,7 @@ use gix_hash::ObjectId;
 
 use crate::core::filesystem::FileSystem;
 use crate::git::{
-    error::{GitError, RefStoreError},
+    error::{GitError, ObjectStoreError, RefStoreError},
     object_store::ObjectStore,
     ref_store::RefStore,
     types::{CommitRequest, CommitResponse, RestoreRequest, RestoreResponse, ShowRequest, ShowResponse},
@@ -222,7 +222,13 @@ impl GitService {
     pub async fn show(&self, req: ShowRequest) -> Result<ShowResponse, GitError> {
         let ShowRequest { account, target_ref, path } = req;
 
-        let commit_oid = resolve_ref(self.ref_store.as_ref(), &account, &target_ref).await?;
+        let commit_oid = resolve_ref(
+            self.ref_store.as_ref(),
+            self.object_store.as_ref(),
+            &account,
+            &target_ref,
+        )
+        .await?;
         let meta = load_commit_meta(self.object_store.as_ref(), &account, &commit_oid).await?;
 
         match path {
@@ -299,7 +305,13 @@ impl GitService {
         let ref_name = format!("refs/heads/{branch}");
 
         // 1. Resolve both commits.
-        let source_oid = resolve_ref(self.ref_store.as_ref(), account, source_commit).await?;
+        let source_oid = resolve_ref(
+            self.ref_store.as_ref(),
+            self.object_store.as_ref(),
+            account,
+            source_commit,
+        )
+        .await?;
         let head_oid = self.ref_store.read(account, &ref_name).await?;
         let source_meta = load_commit_meta(self.object_store.as_ref(), account, &source_oid).await?;
         let head_meta = load_commit_meta(self.object_store.as_ref(), account, &head_oid).await?;
@@ -420,8 +432,15 @@ impl GitService {
                 let abs_prefix = abs_prefix_for_deletes.clone();
                 async move {
                     let abs = format!("{}/{}", abs_prefix, rel);
-                    crate::core::filesystem::FileSystem::remove(vfs.as_ref(), &abs).await?;
-                    Ok::<(), GitError>(())
+                    // Restore is idempotent: a path the diff wants to delete may
+                    // already be absent from the VFS (e.g. derived files like
+                    // `.abstract.md` that were removed or regenerated out of band).
+                    // Treat NotFound as success rather than aborting the restore.
+                    match crate::core::filesystem::FileSystem::remove(vfs.as_ref(), &abs).await {
+                        Ok(_) => Ok::<(), GitError>(()),
+                        Err(crate::core::errors::Error::NotFound(_)) => Ok(()),
+                        Err(e) => Err(e.into()),
+                    }
                 }
             })
             .buffer_unordered(32)
@@ -524,9 +543,12 @@ async fn read_blob_payload(
 ///
 /// Accepts:
 ///   1. 40-hex commit OID (validated by `ObjectId::from_hex`)
-///   2. Full ref path beginning with `refs/` (passed through `validate_ref_name`,
+///   2. Abbreviated OID (4–39 hex chars) — resolved by listing refs and
+///      walking parent chains; returns `OidPrefixNotFound` or `AmbiguousOid`
+///      on zero / multiple matches
+///   3. Full ref path beginning with `refs/` (passed through `validate_ref_name`,
 ///      then read from `ref_store`)
-///   3. Short branch name (e.g. "main") — auto-prefixed to `refs/heads/{name}`,
+///   4. Short branch name (e.g. "main") — auto-prefixed to `refs/heads/{name}`,
 ///      validated, then read from `ref_store`
 ///
 /// Returns `RefStoreError::NotFound` (wrapped) if the ref doesn't exist;
@@ -537,6 +559,7 @@ async fn read_blob_payload(
 /// To disambiguate such a branch, pass the full ref path `refs/heads/<name>`.
 async fn resolve_ref(
     ref_store: &dyn RefStore,
+    object_store: &dyn ObjectStore,
     account: &str,
     target_ref: &str,
 ) -> Result<ObjectId, GitError> {
@@ -546,7 +569,12 @@ async fn resolve_ref(
             .map_err(|e| GitError::Other(format!("invalid oid {target_ref}: {e}")));
     }
 
-    // 2 & 3. Normalize to full ref path then read.
+    // 2. Abbreviated OID (4–39 hex chars) — list refs and walk parent chains.
+    if target_ref.len() >= 4 && target_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return resolve_abbreviated_oid(ref_store, object_store, account, target_ref).await;
+    }
+
+    // 3 & 4. Normalize to full ref path then read.
     let full = if target_ref.starts_with("refs/") {
         target_ref.to_string()
     } else {
@@ -588,6 +616,85 @@ async fn load_commit_meta(
         committer: actor_from_signature_ref(&parsed.committer),
         message: parsed.message.to_string(),
     })
+}
+
+/// Resolve an abbreviated commit OID (4–39 hex chars) by walking the parent
+/// chains from every ref tip in the account. The traversal is bounded by
+/// `MAX_OID_RESOLVE_VISITED` to keep degenerate histories from running away.
+///
+/// Returns:
+/// - `Ok(oid)` if exactly one commit's hex starts with `prefix`.
+/// - `Err(GitError::OidPrefixNotFound)` if no commit matches.
+/// - `Err(GitError::AmbiguousOid)` if 2+ commits match (lists up to 5 candidates).
+///
+/// Lowercases `prefix` before comparison; the input is already known to be
+/// ASCII hex by the caller.
+async fn resolve_abbreviated_oid(
+    ref_store: &dyn RefStore,
+    object_store: &dyn ObjectStore,
+    account: &str,
+    prefix: &str,
+) -> Result<ObjectId, GitError> {
+    use std::collections::HashSet;
+
+    const MAX_OID_RESOLVE_VISITED: usize = 50_000;
+    const MAX_REPORTED_CANDIDATES: usize = 5;
+
+    let prefix_lc = prefix.to_ascii_lowercase();
+
+    let refs = ref_store.list(account, "refs/").await?;
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    let mut queue: Vec<ObjectId> = refs.into_iter().map(|(_, oid)| oid).collect();
+    let mut matches: Vec<ObjectId> = Vec::new();
+
+    while let Some(oid) = queue.pop() {
+        if !visited.insert(oid) {
+            continue;
+        }
+        if visited.len() > MAX_OID_RESOLVE_VISITED {
+            return Err(GitError::Other(format!(
+                "OID prefix resolution aborted: scanned over {MAX_OID_RESOLVE_VISITED} commits without converging"
+            )));
+        }
+        if oid.to_hex().to_string().starts_with(&prefix_lc) {
+            matches.push(oid);
+            if matches.len() > MAX_REPORTED_CANDIDATES {
+                // Continue scanning a little longer to give a useful error,
+                // but we already know it's ambiguous.
+                break;
+            }
+        }
+        let meta = match load_commit_meta(object_store, account, &oid).await {
+            Ok(m) => m,
+            Err(GitError::ObjectStore(ObjectStoreError::NotFound(_))) => continue,
+            Err(GitError::Other(_)) => continue, // not a commit (tag etc.) — skip
+            Err(e) => return Err(e),
+        };
+        for p in meta.parents {
+            if !visited.contains(&p) {
+                queue.push(p);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Err(GitError::OidPrefixNotFound {
+            prefix: prefix.to_string(),
+        }),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => {
+            let listed: Vec<String> = matches
+                .iter()
+                .take(MAX_REPORTED_CANDIDATES)
+                .map(|o| o.to_hex().to_string())
+                .collect();
+            Err(GitError::AmbiguousOid {
+                prefix: prefix.to_string(),
+                count: n,
+                candidates: listed.join(", "),
+            })
+        }
+    }
 }
 
 /// Project a borrowed `gix_actor::SignatureRef` into our owned `Actor` DTO.
@@ -687,6 +794,10 @@ mod tests {
     struct MockVfs {
         account: String,
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        /// When true, `remove` returns NotFound for absent paths (like the real
+        /// VFS) instead of silently succeeding. Used to exercise the idempotent
+        /// delete path in restore.
+        strict_remove: bool,
     }
 
     impl MockVfs {
@@ -694,6 +805,15 @@ mod tests {
             Arc::new(Self {
                 account: account.to_string(),
                 files: Arc::new(Mutex::new(HashMap::new())),
+                strict_remove: false,
+            })
+        }
+
+        fn new_strict_remove(account: &str) -> Arc<Self> {
+            Arc::new(Self {
+                account: account.to_string(),
+                files: Arc::new(Mutex::new(HashMap::new())),
+                strict_remove: true,
             })
         }
 
@@ -719,7 +839,10 @@ mod tests {
             unimplemented!()
         }
         async fn remove(&self, path: &str) -> Result<()> {
-            self.files.lock().unwrap().remove(path);
+            let existed = self.files.lock().unwrap().remove(path).is_some();
+            if self.strict_remove && !existed {
+                return Err(Error::not_found(path));
+            }
             Ok(())
         }
         async fn remove_all(&self, _path: &str) -> Result<()> {
@@ -1310,6 +1433,79 @@ mod tests {
         }
     }
 
+    // ── 10b: abbreviated OID resolution ────────────────────────────────
+    #[tokio::test]
+    async fn test_show_resolves_short_oid_unique() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"hello");
+        let oid = make_commit(&svc, "acct", "main", "first").await;
+        let full = oid.to_hex().to_string();
+
+        for len in [4usize, 7, 12, 39] {
+            let short = &full[..len];
+            let resp = svc
+                .show(ShowRequest {
+                    account: "acct".into(),
+                    target_ref: short.into(),
+                    path: None,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("short oid {short} (len {len}) should resolve, got {e}"));
+            match resp {
+                ShowResponse::Commit { oid: returned, .. } => assert_eq!(returned, oid),
+                other => panic!("len {len}: expected Commit, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_short_oid_not_found_distinguished_from_branch() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"hello");
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        // A 4-hex string that almost-certainly does not match any commit.
+        // (SHA-1 collision against a single commit is astronomically unlikely
+        // for "ffff" — the first commit's hex is deterministic given the
+        // test's actor/time-zero, so this is a stable miss.)
+        let bogus = "ffff";
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: bogus.into(),
+                path: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GitError::OidPrefixNotFound { ref prefix } if prefix == bogus),
+            "expected OidPrefixNotFound({bogus}), got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_short_oid_three_chars_falls_through_to_ref_lookup() {
+        // 3 hex chars is below the 4-char floor for abbreviated OID; it
+        // should be treated as a branch name (which doesn't exist), giving
+        // a RefStore::NotFound error — NOT OidPrefixNotFound.
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/a.md", b"hello");
+        let _ = make_commit(&svc, "acct", "main", "first").await;
+
+        let err = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "abc".into(),
+                path: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GitError::RefStore(RefStoreError::NotFound(_))),
+            "expected RefStore::NotFound for 3-char input, got {err:?}",
+        );
+    }
+
     // ── 11 ─────────────────────────────────────────────────────────────
     #[tokio::test]
     async fn test_show_blob_round_trip() {
@@ -1843,6 +2039,94 @@ mod tests {
             !files.contains_key("/local/acct/resources/proj_a/c.md"),
             "c.md deleted",
         );
+    }
+
+    // Regression: a path the restore diff wants to delete may already be absent
+    // from the VFS (e.g. a derived file like `.abstract.md` removed out of
+    // band). The delete must be idempotent — restore should succeed and advance
+    // the branch ref rather than aborting with a `vfs: not found` error.
+    #[tokio::test]
+    async fn test_restore_tolerates_already_deleted_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = MockVfs::new_strict_remove("acct");
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            ref_store.clone() as Arc<dyn RefStore>,
+        );
+
+        // Source commit: a.md plus a derived file the diff will later delete.
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        // HEAD adds the derived file, so restoring source wants to delete it.
+        vfs.put("resources/proj_a/.abstract.md", b"derived");
+        vfs.put("resources/proj_a/a.md", b"A v2");
+        let head_oid = match svc
+            .commit(req(
+                "acct",
+                "main",
+                "head",
+                Some(vec![
+                    "resources/proj_a/a.md".to_string(),
+                    "resources/proj_a/.abstract.md".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap()
+        {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Simulate the derived file vanishing from the VFS out of band, so the
+        // restore's delete step hits a missing path.
+        vfs.delete("resources/proj_a/.abstract.md");
+
+        let resp = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: "resources/proj_a".into(),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: Some("rewind".into()),
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .expect("restore must tolerate an already-deleted path");
+
+        let new_oid = match resp {
+            RestoreResponse::Applied {
+                deleted,
+                deleted_paths,
+                new_commit_oid,
+                ..
+            } => {
+                // The diff still *plans* the delete (count is unchanged); the
+                // VFS apply just no-ops on the missing path.
+                assert_eq!(deleted, 1, ".abstract.md");
+                assert_eq!(deleted_paths.len(), 1);
+                new_commit_oid
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        };
+
+        // Branch ref advanced to the new commit on top of HEAD.
+        assert_eq!(
+            ref_store.read("acct", "refs/heads/main").await.unwrap(),
+            new_oid
+        );
+        let parents = commit_parents(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct",
+            new_oid,
+        )
+        .await;
+        assert_eq!(parents, vec![head_oid]);
     }
 
     #[tokio::test]

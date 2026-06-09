@@ -120,6 +120,18 @@ pub enum GitError {
     #[error("corrupted object: {0}")]
     CorruptedObject(String),
 
+    /// No object matched the abbreviated OID prefix
+    #[error("no commit found matching OID prefix {prefix}")]
+    OidPrefixNotFound { prefix: String },
+
+    /// Multiple objects matched the abbreviated OID prefix
+    #[error("ambiguous OID prefix {prefix} matches {count} commits: {candidates}")]
+    AmbiguousOid {
+        prefix: String,
+        count: usize,
+        candidates: String,
+    },
+
     /// Other error
     #[error("{0}")]
     Other(String),

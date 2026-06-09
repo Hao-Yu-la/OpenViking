@@ -18,7 +18,7 @@ from openviking.server.dependencies import get_service
 from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import InternalError, NotFoundError
 
 router = APIRouter(prefix="/api/v1/snapshot", tags=["snapshot"])
 
@@ -118,6 +118,14 @@ async def restore(
         if mapped is not None:
             raise mapped from e
         raise
+    except RuntimeError as e:
+        # The native git binding surfaces apply-phase failures (e.g. a VFS
+        # write/delete error) as a bare RuntimeError. Letting it reach the
+        # global mapper mislabels it as a generic "Resource not found" and
+        # discards the real path. Wrap it so the underlying message survives.
+        raise InternalError(
+            f"snapshot restore failed: {e}", cause=e
+        ) from e
     return Response(status="ok", result=result)
 
 

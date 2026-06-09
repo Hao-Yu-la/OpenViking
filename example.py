@@ -1,4 +1,5 @@
 import tempfile, os
+import time
 import openviking as ov
 
 # Initialize OpenViking client with data directory
@@ -12,10 +13,10 @@ try:
     # Local directory scans respect .gitignore by default.
     # Wait until semantic processing completes before inspecting the resource.
     print("Wait for semantic processing...")
-    add_result = client.add_resource(
-        path="https://raw.githubusercontent.com/volcengine/OpenViking/refs/heads/main/README.md",
-        wait=True,
-    )
+    notes_path = os.path.join(tempfile.mkdtemp(), "notes_1.md")
+    with open(notes_path, "w") as f:
+        f.write("# Notes\nA first document.\n")
+    add_result = client.add_resource(path=notes_path, wait=True)
     root_uri = add_result['root_uri']
 
     # Explore the resource tree structure
@@ -34,7 +35,7 @@ try:
     print(f"Abstract:\n{abstract}\n\nOverview:\n{overview}\n")
 
     # Perform semantic search
-    results = client.find("what is openviking", target_uri=root_uri)
+    results = client.find("just test")
     print("Search results:")
     for r in results.resources:
         print(f"  {r.uri} (score: {r.score:.4f})")
@@ -62,9 +63,10 @@ try:
     print(f"v1 commit: {v1['commit_oid'][:12]}  ({v1['result']})")
 
     # Add a second resource and snapshot v2
-    notes_path = os.path.join(tempfile.mkdtemp(), "notes.md")
+    notes_path = os.path.join(tempfile.mkdtemp(), "notes_2.md")
     with open(notes_path, "w") as f:
         f.write("# Notes\nA second document.\n")
+    print("\nWait for semantic processing...")
     client.add_resource(path=notes_path, wait=True)
     v2 = client.git.commit(message="snapshot v2: add notes")
     print(f"v2 commit: {v2['commit_oid'][:12]}  ({v2['result']})")
@@ -73,6 +75,13 @@ try:
     print("\nHistory (newest first):")
     for entry in client.git.log(limit=10):
         print(f"  {entry['oid'][:12]}  {entry['message']}")
+
+    # Perform semantic search
+    time.sleep(3)
+    results = client.find("just test")
+    print("\nSearch results:")
+    for r in results.resources:
+        print(f"  {r.uri} (score: {r.score:.4f})")
 
     # Read a specific blob at v1: notes.md should not exist there yet
     readme_uri = glob_result['matches'][0] if glob_result['matches'] else None
@@ -88,17 +97,24 @@ try:
         project_dir="viking://resources",
         source_commit=v1['commit_oid'],
     )
-    print(f"rollback result: {rollback['result']}")
-    print(f"  source_commit (rolled back to): {rollback['source_commit'][:12]}")
-    print(f"  parent_commit (HEAD before):    {rollback['parent_commit'][:12]}")
-    print(f"  new_commit_oid (forward commit): {rollback['new_commit_oid'][:12]}")
-    print(f"  written_paths: {rollback.get('written_paths', [])}")
-    print(f"  deleted_paths: {rollback.get('deleted_paths', [])}")
+    written_paths = rollback.get('written_paths', [])
+    deleted_paths = rollback.get('deleted_paths', [])
 
-    # Re-run the semantic search: notes.md is gone, find() reflects v1's view
+    print(f"  result:        {rollback['result']}")
+    print(f"  source:        {rollback['source_commit'][:12]}")
+    print(f"  parent:        {rollback['parent_commit'][:12]}")
+    print(f"  new_commit:    {rollback['new_commit_oid'][:12]}")
+    print(f"  written_paths: {len(written_paths)} file(s)")
+    for path in written_paths:
+        print(f"    + {path}")
+    print(f"  deleted_paths: {len(deleted_paths)} file(s)")
+    for path in deleted_paths:
+        print(f"    - {path}")
+
+    # Re-run the semantic search: notes_2.md is gone, find() reflects v1's view
     # once the background reindex finishes.
     client.wait_processed()
-    results_after = client.find("what is openviking", target_uri=root_uri)
+    results_after = client.find("just test")
     print("\nSearch results after rollback:")
     for r in results_after.resources:
         print(f"  {r.uri} (score: {r.score:.4f})")
