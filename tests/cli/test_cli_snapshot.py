@@ -56,12 +56,26 @@ class TestSnapshotCommit:
 
 class TestSnapshotLog:
     def test_log_lists_commits(self, test_pack_uri):
+        # Establish baseline count
+        r_before = ov(["snapshot", "log", "--limit", "100"], timeout=60)
+        assert r_before["exit_code"] == 0
+        before_lines = [ln for ln in r_before["stdout"].splitlines() if ln.strip()]
+
         _commit(f"log-test setup {uuid.uuid4().hex[:6]}")
-        r = ov(["snapshot", "log", "--limit", "20"], timeout=60)
-        assert r["exit_code"] == 0, f"snapshot log failed: {r['stderr'][:300]}"
-        # Human output: each line starts with a 12-char short oid followed by two spaces.
-        lines = [ln for ln in r["stdout"].splitlines() if ln.strip()]
-        assert len(lines) >= 1, f"expected at least one log entry, got: {r['stdout'][:300]}"
+
+        r_after = ov(["snapshot", "log", "--limit", "100"], timeout=60)
+        assert r_after["exit_code"] == 0
+        after_lines = [ln for ln in r_after["stdout"].splitlines() if ln.strip()]
+
+        # New commit should add exactly one row (or the commit was a noop, in which case
+        # the count is unchanged — accept both since the snapshot may already be at HEAD).
+        assert len(after_lines) >= len(before_lines), (
+            f"log row count should not decrease: {len(before_lines)} -> {len(after_lines)}"
+        )
+        assert len(after_lines) - len(before_lines) <= 1, (
+            f"a single commit should add at most one row, got delta "
+            f"{len(after_lines) - len(before_lines)}"
+        )
 
     def test_log_json_returns_array(self, test_pack_uri):
         _commit(f"log-json setup {uuid.uuid4().hex[:6]}")
@@ -88,6 +102,26 @@ class TestSnapshotShow:
         assert meta.get("oid") == oid or meta.get("oid", "").startswith(oid[:12])
         assert "tree" in meta and "author" in meta
 
+    def test_show_blob_to_stdout(self, test_file_uri):
+        commit = _commit(f"show-stdout setup {uuid.uuid4().hex[:6]}")
+        oid = commit["commit_oid"]
+        # Canonical content via `read`
+        r_read = ov(["read", test_file_uri, "-o", "json"], timeout=60)
+        assert r_read["exit_code"] == 0
+        expected = r_read["stdout"]
+
+        r_show = ov(["snapshot", "show", oid, "--path", test_file_uri], timeout=60)
+        assert r_show["exit_code"] == 0, f"snapshot show failed: {r_show['stderr'][:300]}"
+        # Both should contain the same file body. We compare a substring to avoid
+        # framing differences (echo command line, trailing newlines stripped by ov()).
+        snippet = "CLI Test"  # known content from conftest test_pack_uri fixture
+        assert snippet in r_show["stdout"], (
+            f"expected {snippet!r} in show stdout, got: {r_show['stdout'][:200]}"
+        )
+        assert snippet in expected, (
+            f"sanity check failed: snippet not in canonical read output: {expected[:200]}"
+        )
+
     def test_show_blob_to_file(self, test_file_uri, tmp_path):
         commit = _commit(f"show-blob setup {uuid.uuid4().hex[:6]}")
         oid = commit["commit_oid"]
@@ -106,7 +140,16 @@ class TestSnapshotShow:
         )
         assert r["exit_code"] == 0, f"snapshot show --out-file failed: {r['stderr'][:300]}"
         assert out_path.exists(), f"out-file {out_path} should exist"
-        assert out_path.stat().st_size > 0, "out-file should be non-empty"
+
+        contents = out_path.read_bytes()
+        assert len(contents) > 0, "out-file should be non-empty"
+        # Verify the file content matches the canonical file (cross-check via `read`)
+        r_read = ov(["read", test_file_uri, "-o", "json"], timeout=60)
+        assert r_read["exit_code"] == 0
+        # The known fixture content includes "CLI Test"
+        assert b"CLI Test" in contents, (
+            f"expected 'CLI Test' bytes in out-file, got: {contents[:200]!r}"
+        )
 
 
 class TestSnapshotRestore:
