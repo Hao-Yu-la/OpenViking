@@ -2822,9 +2822,11 @@ class VikingFS:
             and corresponding oid / diff fields.
 
         After an ``Applied`` result, this method schedules background vector
-        index rebuilds for each non-derived written/deleted path using
-        :class:`ReindexExecutor`. Failures are logged and do not block the
-        return value.
+        maintenance for the affected paths. Written paths (and deleted derived
+        markers, which redirect to their parent directory) are reindexed via
+        :class:`ReindexExecutor`. Deleted source files have their now-orphaned
+        vectors removed directly, since reindex only upserts and never deletes.
+        Failures are logged and do not block the return value.
         """
         real_ctx = self._ctx_or_default(ctx)
         account = real_ctx.account_id
@@ -2845,10 +2847,24 @@ class VikingFS:
         if dry_run or result.get("result") != "applied":
             return result
 
-        affected: List[str] = list(result.get("written_paths") or [])
-        affected.extend(result.get("deleted_paths") or [])
-        if affected:
-            self._schedule_vector_rebuild(affected, real_ctx)
+        written = list(result.get("written_paths") or [])
+        deleted = list(result.get("deleted_paths") or [])
+
+        # Deleted *source* files leave orphaned vectors behind: ReindexExecutor
+        # only upserts from on-disk content and never deletes, so their records
+        # must be removed explicitly. Deleted *derived* markers
+        # (.abstract.md / .overview.md / sidecars) are instead reindexed,
+        # because _reindex_uri_for_tree_path redirects them to their parent
+        # directory to recompute its L0/L1 vectors from the restored content.
+        deleted_source = [p for p in deleted if not self._is_derived_tree_path(p)]
+        if deleted_source:
+            await self._delete_restored_paths(deleted_source, real_ctx)
+
+        reindex_paths = written + [
+            p for p in deleted if self._is_derived_tree_path(p)
+        ]
+        if reindex_paths:
+            self._schedule_vector_rebuild(reindex_paths, real_ctx)
         return result
 
     async def show(
@@ -2933,6 +2949,25 @@ class VikingFS:
             results.append(commit)
             parents = commit.get("parents") or []
         return results
+
+    async def _delete_restored_paths(
+        self, tree_paths: List[str], ctx: RequestContext
+    ) -> None:
+        """Remove orphaned vectors for source files deleted by a git restore.
+
+        ``tree_paths`` are account-relative paths from the restore diff's
+        ``deleted_paths``. They are converted to ``viking://`` URIs and handed
+        to the tenant-safe URI deletion helper. Failures are logged and never
+        propagate.
+        """
+        uris: List[str] = []
+        for tree_path in tree_paths:
+            try:
+                uris.append(self._tree_path_to_uri(tree_path))
+            except ValueError:
+                continue
+        if uris:
+            await self._delete_from_vector_store(uris, ctx)
 
     def _schedule_vector_rebuild(
         self, tree_paths: List[str], ctx: RequestContext

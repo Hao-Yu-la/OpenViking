@@ -313,12 +313,6 @@ async def test_disabled_raises_not_supported(git_disabled_harness):
         git_disabled_harness.client.git.log()
 
 
-@pytest.mark.skip(reason="Requires live embedding endpoint; covered by manual E2E.")
-def test_semantic_pipeline_with_git_snapshot():
-    # Spec §5.2 #8: add_resource -> find requires live volcengine/ollama embeddings.
-    pass
-
-
 async def test_async_api_parity(git_harness):
     await git_harness.vfs.write_file(
         "viking://resources/async.md",
