@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from openviking.core.context import ContextLevel
 from openviking.core.namespace import canonicalize_uri
 from openviking.core.namespace import (
     is_accessible as namespace_is_accessible,
@@ -2717,34 +2718,45 @@ class VikingFS:
             raise ValueError("tree path must not be empty")
         return f"viking://{cleaned}"
 
-    _DERIVED_BASENAMES = frozenset({".abstract.md", ".overview.md", ".relations.json"})
-    _DERIVED_SIDECAR_SUFFIXES = (".abstract.md", ".overview.md")
+    _DIR_MARKER_LEVELS = {
+        ".abstract.md": ContextLevel.ABSTRACT,
+        ".overview.md": ContextLevel.OVERVIEW,
+    }
+    _NO_VECTOR_DERIVED = frozenset({".relations.json"})
 
-    def _reindex_uri_for_tree_path(self, tree_path: str) -> Optional[str]:
-        """Map a restore-affected tree path to the URI to hand ReindexExecutor.
+    def _classify_restore_path(
+        self, tree_path: str, *, deleted: bool
+    ) -> Optional[tuple]:
+        """Classify a restore-affected tree path into a vector maintenance task.
 
-        Source files reindex themselves. Derived files — the directory-level
-        markers (``dir/.abstract.md``, ``dir/.overview.md``, ``dir/.relations.json``)
-        and per-file sidecars (``x.md.abstract.md``, ``x.md.overview.md``) —
-        redirect to the parent directory so the executor refreshes the
-        L0/L1 vectors from the (already-restored) on-disk content.
+        Returns a ``(op, uri, level)`` triple, or ``None`` when the path has no
+        vector side-effect:
 
-        Returns ``None`` for paths that have no meaningful reindex target
-        (e.g. a derived file at the account root with no parent).
+        - ``dir/.abstract.md`` / ``dir/.overview.md`` → recompute (write) or
+          delete (removal) ONLY that directory's L0/L1 vector:
+          ``("reindex_marker"|"delete", dir_uri, ABSTRACT|OVERVIEW)``.
+        - ``.relations.json`` → ``None`` (not a vector text source).
+        - anything else (a source file) → reindex (write) or delete (removal)
+          its DETAIL vector:
+          ``("reindex_file", file_uri, DETAIL)`` / ``("delete", file_uri, DETAIL)``.
+
+        ``None`` is also returned for a directory marker at the account root
+        (no parent directory to scope an L0/L1 vector to).
         """
         parent, _, name = tree_path.rpartition("/")
-        if name in self._DERIVED_BASENAMES:
-            target = parent
-        elif any(
-            name.endswith(s) and len(name) > len(s)
-            for s in self._DERIVED_SIDECAR_SUFFIXES
-        ):
-            target = parent
-        else:
-            target = tree_path
-        if not target:
+        if name in self._NO_VECTOR_DERIVED:
             return None
-        return self._tree_path_to_uri(target)
+        level = self._DIR_MARKER_LEVELS.get(name)
+        if level is not None:
+            if not parent:
+                return None
+            dir_uri = self._tree_path_to_uri(parent)
+            op = "delete" if deleted else "reindex_marker"
+            return (op, dir_uri, level)
+        # Source file.
+        file_uri = self._tree_path_to_uri(tree_path)
+        op = "delete" if deleted else "reindex_file"
+        return (op, file_uri, ContextLevel.DETAIL)
 
     async def commit(
         self,
@@ -2822,11 +2834,12 @@ class VikingFS:
             and corresponding oid / diff fields.
 
         After an ``Applied`` result, this method schedules background vector
-        maintenance for the affected paths. Written paths (and deleted derived
-        markers, which redirect to their parent directory) are reindexed via
-        :class:`ReindexExecutor`. Deleted source files have their now-orphaned
-        vectors removed directly, since reindex only upserts and never deletes.
-        Failures are logged and do not block the return value.
+        maintenance for the affected paths via :class:`ReindexExecutor`:
+        directory markers (``.abstract.md`` / ``.overview.md``) recompute or
+        delete only that directory's L0/L1 vector; source files reindex (write)
+        or delete (removal) their DETAIL vector. ``.relations.json`` has no
+        vector side-effect. All scheduling is fire-and-forget; failures are
+        logged and do not block the return value.
         """
         real_ctx = self._ctx_or_default(ctx)
         account = real_ctx.account_id
@@ -2849,22 +2862,8 @@ class VikingFS:
 
         written = list(result.get("written_paths") or [])
         deleted = list(result.get("deleted_paths") or [])
-
-        # Deleted *source* files leave orphaned vectors behind: ReindexExecutor
-        # only upserts from on-disk content and never deletes, so their records
-        # must be removed explicitly. Deleted *derived* markers
-        # (.abstract.md / .overview.md / sidecars) are instead reindexed,
-        # because _reindex_uri_for_tree_path redirects them to their parent
-        # directory to recompute its L0/L1 vectors from the restored content.
-        deleted_source = [p for p in deleted if not self._is_derived_tree_path(p)]
-        if deleted_source:
-            await self._delete_restored_paths(deleted_source, real_ctx)
-
-        reindex_paths = written + [
-            p for p in deleted if self._is_derived_tree_path(p)
-        ]
-        if reindex_paths:
-            self._schedule_vector_rebuild(reindex_paths, real_ctx)
+        if written or deleted:
+            self._schedule_vector_rebuild(written=written, deleted=deleted, ctx=real_ctx)
         return result
 
     async def show(
@@ -2950,46 +2949,28 @@ class VikingFS:
             parents = commit.get("parents") or []
         return results
 
-    async def _delete_restored_paths(
-        self, tree_paths: List[str], ctx: RequestContext
-    ) -> None:
-        """Remove orphaned vectors for source files deleted by a git restore.
-
-        ``tree_paths`` are account-relative paths from the restore diff's
-        ``deleted_paths``. They are converted to ``viking://`` URIs and handed
-        to the tenant-safe URI deletion helper. Failures are logged and never
-        propagate.
-        """
-        uris: List[str] = []
-        for tree_path in tree_paths:
-            try:
-                uris.append(self._tree_path_to_uri(tree_path))
-            except ValueError:
-                continue
-        if uris:
-            await self._delete_from_vector_store(uris, ctx)
-
     def _schedule_vector_rebuild(
-        self, tree_paths: List[str], ctx: RequestContext
+        self,
+        *,
+        written: List[str],
+        deleted: List[str],
+        ctx: RequestContext,
     ) -> None:
-        """Fire-and-forget vector reindex for paths affected by a git restore.
+        """Fire-and-forget precise vector maintenance for a git restore.
 
-        Derived files (`.abstract.md` / `.overview.md` / `.relations.json` and
-        their per-file sidecars) are redirected to their parent directory so
-        the directory-level L0/L1 vectors get recomputed from the restored
-        on-disk content. Source files are reindexed directly.
+        Each affected path is classified by :py:meth:`_classify_restore_path`
+        into a ``(op, uri, level)`` task and scheduled independently:
 
-        Two layers of deduplication are applied to avoid wasted embedding
-        work:
+        - ``reindex_marker`` — recompute only a directory's L0/L1 vector.
+        - ``reindex_file`` — recompute only a source file's DETAIL vector
+          (non-recursive ``execute(mode="vectors_only")``).
+        - ``delete`` — remove only the ``(uri, level)`` vector (directory
+          marker removal, or deleted source file).
 
-        1. Exact URI dedup — the same URI scheduled multiple times runs once.
-        2. Ancestor subsumption — if a directory URI is scheduled (from a
-           restored derived file), any source-file URI under that directory is
-           dropped, because :class:`ReindexExecutor` already recurses through
-           the directory and reindexes every leaf's DETAIL vector. Keeping
-           both would double-embed every covered file.
-
-        Failures are logged and never propagate.
+        Tasks are deduplicated on the exact ``(op, uri, level)`` key (no
+        ancestor subsumption — each change is handled independently because no
+        operation recurses into descendants). Failures are logged and never
+        propagate.
         """
         try:
             from openviking.service.reindex_executor import get_reindex_executor
@@ -3005,70 +2986,55 @@ class VikingFS:
             )
             return
 
-        # Pass 1: collect unique URIs and classify by whether they came from
-        # a derived (directory-scope) path or a source (file-scope) path.
-        dir_uris: set[str] = set()
-        file_uris: set[str] = set()
-        for tree_path in tree_paths:
+        tasks: set[tuple] = set()
+        for tree_path in written:
             try:
-                uri = self._reindex_uri_for_tree_path(tree_path)
+                task = self._classify_restore_path(tree_path, deleted=False)
             except ValueError:
                 continue
-            if uri is None:
+            if task is not None:
+                tasks.add(task)
+        for tree_path in deleted:
+            try:
+                task = self._classify_restore_path(tree_path, deleted=True)
+            except ValueError:
                 continue
-            if self._is_derived_tree_path(tree_path):
-                dir_uris.add(uri)
-            else:
-                file_uris.add(uri)
+            if task is not None:
+                tasks.add(task)
 
-        # Pass 2: reduce directory URIs to a minimal set by dropping any dir
-        # nested under another scheduled dir. The executor recurses through a
-        # directory's whole subtree, so an ancestor task already covers its
-        # descendants. Scheduling both would race for overlapping tree locks
-        # (the ancestor's descendant-lock scan blocks on the child's lock).
-        # URIs sort so that an ancestor always precedes its descendants.
-        minimal_dirs: set[str] = set()
-        for dir_uri in sorted(dir_uris):
-            if any(dir_uri.startswith(parent + "/") for parent in minimal_dirs):
-                continue
-            minimal_dirs.add(dir_uri)
-
-        effective: set[str] = set(minimal_dirs)
-        for file_uri in file_uris:
-            if any(file_uri.startswith(d + "/") for d in minimal_dirs):
-                continue
-            effective.add(file_uri)
+        if not tasks:
+            return
 
         executor = get_reindex_executor()
-        for uri in effective:
+        for op, uri, level in tasks:
             loop.create_task(
-                self._run_vector_rebuild(executor, uri, ctx),
-                name=f"vikingfs-git-reindex:{uri}",
+                self._run_vector_rebuild(executor, op, uri, level, ctx),
+                name=f"vikingfs-git-{op}:{uri}:{int(level)}",
             )
-
-    @classmethod
-    def _is_derived_tree_path(cls, tree_path: str) -> bool:
-        """True iff the tree path's basename is a derived L0/L1 marker or
-        per-file sidecar — i.e. :py:meth:`_reindex_uri_for_tree_path` will
-        redirect it to its parent directory."""
-        name = tree_path.rpartition("/")[2]
-        if name in cls._DERIVED_BASENAMES:
-            return True
-        return any(
-            name.endswith(s) and len(name) > len(s)
-            for s in cls._DERIVED_SIDECAR_SUFFIXES
-        )
 
     async def _run_vector_rebuild(
         self,
         executor: Any,
+        op: str,
         uri: str,
+        level: ContextLevel,
         ctx: RequestContext,
     ) -> None:
-        """Wrapper coroutine: run ReindexExecutor and swallow errors."""
+        """Wrapper coroutine: dispatch one vector task and swallow errors."""
         try:
-            await executor.execute(uri=uri, mode="vectors_only", wait=False, ctx=ctx)
+            if op == "reindex_marker":
+                await executor.reindex_directory_marker(
+                    dir_uri=uri, level=level, ctx=ctx
+                )
+            elif op == "reindex_file":
+                await executor.execute(
+                    uri=uri, mode="vectors_only", wait=False, ctx=ctx
+                )
+            elif op == "delete":
+                await executor.delete_uri_level(uri=uri, level=level, ctx=ctx)
+            else:  # pragma: no cover - defensive
+                logger.warning("[VikingFS] unknown vector rebuild op %r for %s", op, uri)
         except Exception:
             logger.exception(
-                "[VikingFS] git restore vector rebuild failed for %s", uri
+                "[VikingFS] git restore vector task %s failed for %s", op, uri
             )

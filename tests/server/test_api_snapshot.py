@@ -247,31 +247,30 @@ async def test_restore_delete_removes_orphaned_vectors(client_with_resource_and_
 
     ReindexExecutor only upserts from on-disk content and never deletes, so a
     file removed by the restore would otherwise leave orphaned vectors behind.
-    viking_fs.restore must route deleted source paths to _delete_from_vector_store.
+    viking_fs.restore must route deleted source paths to the executor's
+    level-precise delete (DETAIL).
     """
     from openviking.server.identity import RequestContext, Role
     from openviking_cli.session.user_id import UserIdentifier
-    from openviking.storage.viking_fs import VikingFS
     import openviking.service.reindex_executor as reindex_mod
 
     client, c1_oid, _blob_uri, _v1 = client_with_resource_and_blob
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
 
-    # Silence the reindex scheduler so the test isolates the delete path.
-    class _NoopExecutor:
+    deleted_calls: list[tuple] = []
+
+    class _SpyExecutor:
         async def execute(self, *, uri, mode, wait, ctx):
             return {"ok": True}
 
-    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _NoopExecutor())
+        async def reindex_directory_marker(self, *, dir_uri, level, ctx):
+            return None
 
-    deleted_uri_batches: list[list[str]] = []
-    real_delete = VikingFS._delete_from_vector_store
+        async def delete_uri_level(self, *, uri, level, ctx):
+            deleted_calls.append((uri, int(level)))
+            return 0
 
-    async def _spy_delete(self, uris, ctx=None):
-        deleted_uri_batches.append(list(uris))
-        return await real_delete(self, uris, ctx)
-
-    monkeypatch.setattr(VikingFS, "_delete_from_vector_store", _spy_delete)
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
 
     # Add a brand-new file that does not exist at c1, then commit v2.
     new_uri = "viking://resources/restore_delete_fixture.txt"
@@ -286,9 +285,12 @@ async def test_restore_delete_removes_orphaned_vectors(client_with_resource_and_
     assert restore_resp.status_code == 200, restore_resp.text
     assert restore_resp.json()["result"]["result"] == "applied"
 
-    all_deleted = [u for batch in deleted_uri_batches for u in batch]
-    assert new_uri in all_deleted, (
-        f"deleted file's vectors must be purged; got {all_deleted!r}"
+    import asyncio
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert (new_uri, 2) in deleted_calls, (
+        f"deleted file's DETAIL vector must be purged; got {deleted_calls!r}"
     )
 
 

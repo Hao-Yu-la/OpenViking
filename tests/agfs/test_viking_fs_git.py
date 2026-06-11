@@ -460,69 +460,95 @@ async def test_feature_disabled_raises_not_supported(vfs_disabled):
 # =========================================================================
 
 
-def test_reindex_uri_for_tree_path_redirects_derived(vfs):
-    # Per-file sidecars redirect to parent directory
-    assert (
-        vfs._reindex_uri_for_tree_path("resources/proj/x.md.abstract.md")
-        == "viking://resources/proj"
-    )
-    assert (
-        vfs._reindex_uri_for_tree_path("resources/proj/x.md.overview.md")
-        == "viking://resources/proj"
-    )
-    # Directory-level markers redirect to the directory itself
-    assert (
-        vfs._reindex_uri_for_tree_path("resources/proj/.abstract.md")
-        == "viking://resources/proj"
-    )
-    assert (
-        vfs._reindex_uri_for_tree_path("resources/proj/.overview.md")
-        == "viking://resources/proj"
-    )
-    assert (
-        vfs._reindex_uri_for_tree_path("resources/proj/.relations.json")
-        == "viking://resources/proj"
-    )
-    # Source files pass through unchanged
-    assert (
-        vfs._reindex_uri_for_tree_path("resources/proj/x.md")
-        == "viking://resources/proj/x.md"
-    )
-    # Derived file with no parent -> None (defensive)
-    assert vfs._reindex_uri_for_tree_path(".abstract.md") is None
+def test_classify_restore_path(vfs):
+    from openviking.core.context import ContextLevel
+
+    # Directory-level markers -> (op, dir_uri, level)
+    assert vfs._classify_restore_path(
+        "resources/proj/.abstract.md", deleted=False
+    ) == ("reindex_marker", "viking://resources/proj", ContextLevel.ABSTRACT)
+    assert vfs._classify_restore_path(
+        "resources/proj/.overview.md", deleted=False
+    ) == ("reindex_marker", "viking://resources/proj", ContextLevel.OVERVIEW)
+    assert vfs._classify_restore_path(
+        "resources/proj/.abstract.md", deleted=True
+    ) == ("delete", "viking://resources/proj", ContextLevel.ABSTRACT)
+    assert vfs._classify_restore_path(
+        "resources/proj/.overview.md", deleted=True
+    ) == ("delete", "viking://resources/proj", ContextLevel.OVERVIEW)
+
+    # .relations.json has no vector side-effect
+    assert vfs._classify_restore_path(
+        "resources/proj/.relations.json", deleted=False
+    ) is None
+    assert vfs._classify_restore_path(
+        "resources/proj/.relations.json", deleted=True
+    ) is None
+
+    # Per-file sidecars do NOT exist in production -> treated as ordinary source files
+    assert vfs._classify_restore_path(
+        "resources/proj/x.md.abstract.md", deleted=False
+    ) == ("reindex_file", "viking://resources/proj/x.md.abstract.md", ContextLevel.DETAIL)
+    assert vfs._classify_restore_path(
+        "resources/proj/x.md.overview.md", deleted=True
+    ) == ("delete", "viking://resources/proj/x.md.overview.md", ContextLevel.DETAIL)
+
+    # Source files -> DETAIL reindex/delete
+    assert vfs._classify_restore_path(
+        "resources/proj/x.md", deleted=False
+    ) == ("reindex_file", "viking://resources/proj/x.md", ContextLevel.DETAIL)
+    assert vfs._classify_restore_path(
+        "resources/proj/x.md", deleted=True
+    ) == ("delete", "viking://resources/proj/x.md", ContextLevel.DETAIL)
+
+    # Directory marker at the account root -> None (no parent dir to scope)
+    assert vfs._classify_restore_path(".abstract.md", deleted=False) is None
+
+
+class _SpyExecutor:
+    """Records every scheduled vector task as a normalized tuple."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    async def execute(self, *, uri, mode, wait, ctx):
+        self.calls.append(("reindex_file", uri))
+        return {"ok": True}
+
+    async def reindex_directory_marker(self, *, dir_uri, level, ctx):
+        self.calls.append(("reindex_marker", dir_uri, int(level)))
+
+    async def delete_uri_level(self, *, uri, level, ctx):
+        self.calls.append(("delete", uri, int(level)))
+        return 0
 
 
 @pytest.mark.asyncio
 async def test_restore_schedules_reindex_for_derived_only_change(vfs, monkeypatch):
-    """When a restore only changes a `.abstract.md` (source file unchanged),
-    the parent directory URI must still be scheduled for reindex so the
-    L0/L1 vectors get refreshed from the restored on-disk content.
+    """When a restore only changes a directory `.abstract.md` (source file
+    unchanged), exactly that directory's L0 vector must be recomputed via
+    reindex_directory_marker — and nothing else (no whole-tree rebuild).
     """
-    calls: list[str] = []
-
-    class _SpyExecutor:
-        async def execute(self, *, uri, mode, wait, ctx):
-            calls.append(uri)
-            return {"ok": True}
+    spy = _SpyExecutor()
 
     import openviking.service.reindex_executor as reindex_mod
-    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: spy)
 
     ctx = _make_ctx(account="acct_derived_only")
     await vfs.write_file("viking://resources/proj/x.md", b"body", ctx=ctx)
     await vfs.write_file(
-        "viking://resources/proj/x.md.abstract.md", b"abs-v1", ctx=ctx
+        "viking://resources/proj/.abstract.md", b"abs-v1", ctx=ctx
     )
     c1 = await vfs.commit(message="v1", ctx=ctx)
     assert c1["result"] == "created"
 
-    # Modify ONLY the derived sidecar; source file untouched
+    # Modify ONLY the directory marker; source file untouched
     await vfs.write_file(
-        "viking://resources/proj/x.md.abstract.md", b"abs-v2", ctx=ctx
+        "viking://resources/proj/.abstract.md", b"abs-v2", ctx=ctx
     )
     c2 = await vfs.commit(
         message="v2",
-        paths=["viking://resources/proj/x.md.abstract.md"],
+        paths=["viking://resources/proj/.abstract.md"],
         ctx=ctx,
     )
     assert c2["result"] == "created"
@@ -534,47 +560,38 @@ async def test_restore_schedules_reindex_for_derived_only_change(vfs, monkeypatc
         ctx=ctx,
     )
     assert result["result"] == "applied"
-    assert "resources/proj/x.md.abstract.md" in result["written_paths"]
+    assert "resources/proj/.abstract.md" in result["written_paths"]
 
     # Let the fire-and-forget tasks run
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    assert calls == ["viking://resources/proj"]
+    assert spy.calls == [("reindex_marker", "viking://resources/proj", 0)]
 
 
 @pytest.mark.asyncio
-async def test_restore_schedules_reindex_subsumes_files_under_scheduled_dir(vfs, monkeypatch):
-    """When a directory URI is scheduled (because a derived sidecar was
-    restored), any source-file URI inside that directory must be dropped —
-    ReindexExecutor's directory walk already reindexes every leaf's DETAIL.
+async def test_restore_schedules_marker_and_files_independently(vfs, monkeypatch):
+    """Ancestor subsumption is gone: a changed directory marker recomputes the
+    directory's L0/L1, while each changed source file independently reindexes
+    its own DETAIL vector — neither subsumes the other.
     """
-    calls: list[str] = []
-
-    class _SpyExecutor:
-        async def execute(self, *, uri, mode, wait, ctx):
-            calls.append(uri)
-            return {"ok": True}
+    spy = _SpyExecutor()
 
     import openviking.service.reindex_executor as reindex_mod
-    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: spy)
 
     ctx = _make_ctx(account="acct_dedup")
     await vfs.write_file("viking://resources/proj/x.md", b"v1", ctx=ctx)
+    await vfs.write_file("viking://resources/proj/y.md", b"yv1", ctx=ctx)
     await vfs.write_file(
-        "viking://resources/proj/x.md.abstract.md", b"a-v1", ctx=ctx
-    )
-    await vfs.write_file(
-        "viking://resources/proj/y.md.abstract.md", b"b-v1", ctx=ctx
+        "viking://resources/proj/.abstract.md", b"a-v1", ctx=ctx
     )
     c1 = await vfs.commit(message="v1", ctx=ctx)
 
     await vfs.write_file("viking://resources/proj/x.md", b"v2", ctx=ctx)
+    await vfs.write_file("viking://resources/proj/y.md", b"yv2", ctx=ctx)
     await vfs.write_file(
-        "viking://resources/proj/x.md.abstract.md", b"a-v2", ctx=ctx
-    )
-    await vfs.write_file(
-        "viking://resources/proj/y.md.abstract.md", b"b-v2", ctx=ctx
+        "viking://resources/proj/.abstract.md", b"a-v2", ctx=ctx
     )
     await vfs.commit(message="v2", ctx=ctx)
 
@@ -586,39 +603,37 @@ async def test_restore_schedules_reindex_subsumes_files_under_scheduled_dir(vfs,
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    # The directory URI subsumes the source file URI — only the dir runs.
-    assert calls == ["viking://resources/proj"]
+    # Directory marker recompute + each source file's DETAIL, all independent.
+    assert sorted(spy.calls) == sorted([
+        ("reindex_marker", "viking://resources/proj", 0),
+        ("reindex_file", "viking://resources/proj/x.md"),
+        ("reindex_file", "viking://resources/proj/y.md"),
+    ])
 
 
 @pytest.mark.asyncio
-async def test_restore_schedules_reindex_keeps_files_outside_scheduled_dir(vfs, monkeypatch):
-    """A source file in a sibling directory must NOT be dropped just because
-    another directory is scheduled — only descendants of scheduled dirs are
-    subsumed.
+async def test_restore_schedules_siblings_independently(vfs, monkeypatch):
+    """Source files in sibling directories are each scheduled independently;
+    a directory marker change only affects its own directory.
     """
-    calls: list[str] = []
-
-    class _SpyExecutor:
-        async def execute(self, *, uri, mode, wait, ctx):
-            calls.append(uri)
-            return {"ok": True}
+    spy = _SpyExecutor()
 
     import openviking.service.reindex_executor as reindex_mod
-    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: _SpyExecutor())
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: spy)
 
     ctx = _make_ctx(account="acct_subsume_sibling")
-    # proj_a: source file + derived sidecar (will produce dir + file URIs)
+    # proj_a: source file + directory marker
     await vfs.write_file("viking://resources/proj_a/x.md", b"v1", ctx=ctx)
     await vfs.write_file(
-        "viking://resources/proj_a/x.md.abstract.md", b"a-v1", ctx=ctx
+        "viking://resources/proj_a/.abstract.md", b"a-v1", ctx=ctx
     )
-    # proj_b: source file only (no derived) — sibling directory
+    # proj_b: source file only — sibling directory
     await vfs.write_file("viking://resources/proj_b/y.md", b"v1", ctx=ctx)
     c1 = await vfs.commit(message="v1", ctx=ctx)
 
     await vfs.write_file("viking://resources/proj_a/x.md", b"v2", ctx=ctx)
     await vfs.write_file(
-        "viking://resources/proj_a/x.md.abstract.md", b"a-v2", ctx=ctx
+        "viking://resources/proj_a/.abstract.md", b"a-v2", ctx=ctx
     )
     await vfs.write_file("viking://resources/proj_b/y.md", b"v2", ctx=ctx)
     await vfs.commit(message="v2", ctx=ctx)
@@ -632,9 +647,84 @@ async def test_restore_schedules_reindex_keeps_files_outside_scheduled_dir(vfs, 
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    # proj_a's sidecar -> viking://resources/proj_a (dir, subsumes x.md)
-    # proj_b/y.md -> viking://resources/proj_b/y.md (no dir scheduled -> kept)
-    assert sorted(calls) == sorted([
-        "viking://resources/proj_a",
-        "viking://resources/proj_b/y.md",
+    assert sorted(spy.calls) == sorted([
+        ("reindex_marker", "viking://resources/proj_a", 0),
+        ("reindex_file", "viking://resources/proj_a/x.md"),
+        ("reindex_file", "viking://resources/proj_b/y.md"),
     ])
+
+
+@pytest.mark.asyncio
+async def test_restore_deletes_marker_and_source_vectors(vfs, monkeypatch):
+    """Bug 1 regression: restoring to a revision that predates a whole
+    directory must delete BOTH the directory's L0/L1 marker vectors and the
+    deleted source file's DETAIL vector — no orphaned vectors left behind.
+    """
+    spy = _SpyExecutor()
+
+    import openviking.service.reindex_executor as reindex_mod
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: spy)
+
+    ctx = _make_ctx(account="acct_del_marker")
+    await vfs.write_file("viking://resources/keep/k.md", b"keep", ctx=ctx)
+    c1 = await vfs.commit(message="v1", ctx=ctx)
+
+    # v2 adds a whole new directory with a source file + directory markers.
+    await vfs.write_file("viking://resources/gone/g.md", b"gone", ctx=ctx)
+    await vfs.write_file("viking://resources/gone/.abstract.md", b"abs", ctx=ctx)
+    await vfs.write_file("viking://resources/gone/.overview.md", b"ovr", ctx=ctx)
+    await vfs.commit(message="v2", ctx=ctx)
+
+    # Restore back to v1: everything under gone/ must be removed.
+    result = await vfs.restore(
+        project_dir="viking://resources",
+        source_commit=c1["commit_oid"],
+        ctx=ctx,
+    )
+    assert result["result"] == "applied"
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert ("delete", "viking://resources/gone", 0) in spy.calls
+    assert ("delete", "viking://resources/gone", 1) in spy.calls
+    assert ("delete", "viking://resources/gone/g.md", 2) in spy.calls
+    # No whole-tree reindex of the deleted dir.
+    assert all(c[0] != "reindex_marker" or c[1] != "viking://resources/gone" for c in spy.calls)
+
+
+@pytest.mark.asyncio
+async def test_restore_relations_json_has_no_vector_side_effect(vfs, monkeypatch):
+    """A restore that only touches `.relations.json` must schedule no vector
+    reindex/delete tasks at all.
+    """
+    spy = _SpyExecutor()
+
+    import openviking.service.reindex_executor as reindex_mod
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: spy)
+
+    ctx = _make_ctx(account="acct_relations")
+    await vfs.write_file(
+        "viking://resources/proj/.relations.json", b"{\"v\":1}", ctx=ctx
+    )
+    c1 = await vfs.commit(message="v1", ctx=ctx)
+
+    await vfs.write_file(
+        "viking://resources/proj/.relations.json", b"{\"v\":2}", ctx=ctx
+    )
+    c2 = await vfs.commit(
+        message="v2",
+        paths=["viking://resources/proj/.relations.json"],
+        ctx=ctx,
+    )
+    assert c2["result"] == "created"
+
+    result = await vfs.restore(
+        project_dir="viking://resources/proj",
+        source_commit=c1["commit_oid"],
+        ctx=ctx,
+    )
+    assert result["result"] == "applied"
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert spy.calls == []
