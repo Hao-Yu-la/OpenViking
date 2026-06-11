@@ -136,16 +136,73 @@ def _generate_plugin_config(agfs_config: Any, data_path: Path) -> Dict[str, Any]
 
 
 def _render_git_toml(git_config: Any, storage_path: Path) -> str:
-    """Render a TOML body with [git] and [git.local] sections from a GitConfig.
+    """Render a TOML body with [git] and a backend-specific section from a GitConfig.
+
+    For ``backend == "local"`` a ``[git.local]`` section is emitted (defaulting
+    ``base_dir`` to ``{storage_path}/git`` when empty). For ``backend == "s3"`` a
+    ``[git.s3]`` section is emitted with keys matching the Rust ``GitS3ConfigPy``
+    serde struct so the ragfs binding consumes it verbatim.
 
     The format mirrors the working fixture used in the ragfs_python binding tests
-    (see tests/agfs/test_viking_fs_git.py). When ``git_config.local.base_dir`` is
-    empty, it defaults to ``{storage_path}/git``.
+    (see tests/agfs/test_viking_fs_git.py).
     """
     def _q(s: str) -> str:
         # Escape backslash first, then double-quote, then wrap in quotes.
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
+    def _b(v: Any) -> str:
+        return "true" if v else "false"
+
+    enabled = "true" if getattr(git_config, "enabled", False) else "false"
+    backend = getattr(git_config, "backend", "local")
+    default_branch = getattr(git_config, "default_branch", "main")
+    author_name = getattr(git_config, "author_name", "viking-bot")
+    author_email = getattr(git_config, "author_email", "bot@viking.local")
+
+    header = (
+        "[git]\n"
+        f"enabled = {enabled}\n"
+        f"backend = {_q(backend)}\n"
+        f"default_branch = {_q(default_branch)}\n"
+        f"author_name = {_q(author_name)}\n"
+        f"author_email = {_q(author_email)}\n"
+        "\n"
+    )
+
+    if backend == "s3":
+        s3_cfg = getattr(git_config, "s3", None)
+        if s3_cfg is None:
+            raise ValueError("git backend 's3' requires a [git.s3] section")
+        bucket = getattr(s3_cfg, "bucket", "")
+        region = getattr(s3_cfg, "region", "us-east-1")
+        prefix = getattr(s3_cfg, "prefix", "git")
+        endpoint = getattr(s3_cfg, "endpoint", "")
+        access_key = getattr(s3_cfg, "access_key", None)
+        secret_key = getattr(s3_cfg, "secret_key", None)
+        cas_mode = getattr(s3_cfg, "cas_mode", "native")
+        redis_lock_url = getattr(s3_cfg, "redis_lock_url", None)
+        use_path_style = getattr(s3_cfg, "use_path_style", True)
+
+        lines = [
+            "[git.s3]\n",
+            f"bucket = {_q(bucket)}\n",
+            f"region = {_q(region)}\n",
+            f"prefix = {_q(prefix)}\n",
+            f"endpoint = {_q(endpoint)}\n",
+        ]
+        # Only emit credentials when provided; otherwise the binding falls back
+        # to the SDK default credentials chain.
+        if access_key:
+            lines.append(f"access_key = {_q(access_key)}\n")
+        if secret_key:
+            lines.append(f"secret_key = {_q(secret_key)}\n")
+        lines.append(f"cas_mode = {_q(cas_mode)}\n")
+        if redis_lock_url:
+            lines.append(f"redis_lock_url = {_q(redis_lock_url)}\n")
+        lines.append(f"use_path_style = {_b(use_path_style)}\n")
+        return header + "".join(lines)
+
+    # Default: local backend
     local_cfg = getattr(git_config, "local", None)
     base_dir = getattr(local_cfg, "base_dir", "") if local_cfg is not None else ""
     if not base_dir:
@@ -154,21 +211,9 @@ def _render_git_toml(git_config: Any, storage_path: Path) -> str:
         base_dir = str(Path(base_dir).expanduser())
     fsync = getattr(local_cfg, "fsync", "off") if local_cfg is not None else "off"
 
-    enabled = "true" if getattr(git_config, "enabled", False) else "false"
-    backend = getattr(git_config, "backend", "local")
-    default_branch = getattr(git_config, "default_branch", "main")
-    author_name = getattr(git_config, "author_name", "viking-bot")
-    author_email = getattr(git_config, "author_email", "bot@viking.local")
-
     return (
-        "[git]\n"
-        f"enabled = {enabled}\n"
-        f"backend = {_q(backend)}\n"
-        f"default_branch = {_q(default_branch)}\n"
-        f"author_name = {_q(author_name)}\n"
-        f"author_email = {_q(author_email)}\n"
-        "\n"
-        "[git.local]\n"
+        header
+        + "[git.local]\n"
         f"base_dir = {_q(base_dir)}\n"
         f"fsync = {_q(fsync)}\n"
     )

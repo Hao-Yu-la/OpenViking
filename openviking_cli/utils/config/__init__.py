@@ -50,7 +50,7 @@ from .consts import (
     SYSTEM_CONFIG_DIR,
 )
 from .embedding_config import EmbeddingConfig
-from .git_config import GitConfig, GitLocalConfig
+from .git_config import GitConfig, GitLocalConfig, GitS3Config
 from .log_config import LogConfig
 from .open_viking_config import (
     OpenVikingConfig,
@@ -160,4 +160,5 @@ __all__ = [
     "TracerConfig",
     "GitConfig",
     "GitLocalConfig",
+    "GitS3Config",
 ]

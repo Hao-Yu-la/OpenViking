@@ -972,8 +972,8 @@ bucket            = "openviking-prod"
 prefix            = "git"          # 全部 key = {prefix}/{account}/...
 region            = "us-east-1"
 endpoint          = "https://s3.amazonaws.com"
-access_key_env    = "OV_S3_AK"     # 从环境变量读
-secret_key_env    = "OV_S3_SK"
+access_key        = "AKxxxx"       # 直接从配置读取(留空则用 SDK 默认凭证链)
+secret_key        = "SKxxxx"
 cas_mode          = "native"       # "native"(If-Match) | "redis_lock"
 redis_lock_url    = ""             # cas_mode=redis_lock 时必填
 

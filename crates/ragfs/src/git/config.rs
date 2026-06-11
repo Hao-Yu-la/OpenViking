@@ -40,9 +40,9 @@ pub struct GitS3ConfigPy {
     #[serde(default)]
     pub endpoint: String,
     #[serde(default)]
-    pub access_key_env: Option<String>,
+    pub access_key: Option<String>,
     #[serde(default)]
-    pub secret_key_env: Option<String>,
+    pub secret_key: Option<String>,
     #[serde(default = "default_cas_mode")]
     pub cas_mode: String,
     #[serde(default)]
@@ -152,8 +152,8 @@ mod tests {
             bucket = "ov-bucket"
             region = "us-west-2"
             endpoint = "https://s3.example.com"
-            access_key_env = "AK"
-            secret_key_env = "SK"
+            access_key = "AKxxx"
+            secret_key = "SKxxx"
 
             [tuning]
             upload_concurrency = 128

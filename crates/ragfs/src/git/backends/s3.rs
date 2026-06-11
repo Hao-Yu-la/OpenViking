@@ -105,19 +105,7 @@ impl S3ObjectStore {
 
     /// Build the full S3 key for a Git object
     fn object_key(&self, account: &str, oid: &ObjectId) -> String {
-        let hex = oid.to_hex().to_string();
-        let prefix = self.prefix.trim_end_matches('/');
-        if prefix.is_empty() {
-            format!("{}/objects/{}/{}", account, &hex[..2], &hex[2..])
-        } else {
-            format!(
-                "{}/{}/objects/{}/{}",
-                prefix,
-                account,
-                &hex[..2],
-                &hex[2..]
-            )
-        }
+        build_object_key(&self.prefix, account, oid)
     }
 }
 
@@ -288,12 +276,7 @@ impl S3RefStore {
 
     /// Build the full S3 key for a Git ref
     fn ref_key(&self, account: &str, ref_name: &str) -> String {
-        let prefix = self.prefix.trim_end_matches('/');
-        if prefix.is_empty() {
-            format!("{}/{}", account, ref_name)
-        } else {
-            format!("{}/{}/{}", prefix, account, ref_name)
-        }
+        build_ref_key(&self.prefix, account, ref_name)
     }
 
     /// Read the current value of a ref, returning None if it doesn't exist
@@ -321,10 +304,7 @@ impl S3RefStore {
                     .map_err(|e| RefStoreError::Backend(format!("S3 read body error: {:?}", e)))?;
                 let vec_bytes = bytes.to_vec();
                 let content = String::from_utf8_lossy(&vec_bytes);
-                let trimmed = content.trim();
-                let oid = trimmed
-                    .parse::<ObjectId>()
-                    .map_err(|_| RefStoreError::Backend(format!("invalid oid in ref: {}", trimmed)))?;
+                let oid = parse_ref_oid(&content)?;
                 Ok(Some((oid, etag)))
             }
             Err(err) => {
@@ -508,9 +488,50 @@ impl RefStore for S3RefStore {
     }
 }
 
+/// Build the full S3 key for a Git object.
+///
+/// Layout: `{prefix}/{account}/objects/{aa}/{bb..}` where `aa` is the first two
+/// hex chars of the object id. When `prefix` is empty the leading segment is
+/// omitted. A trailing slash on `prefix` is ignored.
+fn build_object_key(prefix: &str, account: &str, oid: &ObjectId) -> String {
+    let hex = oid.to_hex().to_string();
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        format!("{}/objects/{}/{}", account, &hex[..2], &hex[2..])
+    } else {
+        format!("{}/{}/objects/{}/{}", prefix, account, &hex[..2], &hex[2..])
+    }
+}
+
+/// Build the full S3 key for a Git ref.
+///
+/// Layout: `{prefix}/{account}/{ref_name}`. When `prefix` is empty the leading
+/// segment is omitted. A trailing slash on `prefix` is ignored.
+fn build_ref_key(prefix: &str, account: &str, ref_name: &str) -> String {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        format!("{}/{}", account, ref_name)
+    } else {
+        format!("{}/{}/{}", prefix, account, ref_name)
+    }
+}
+
+/// Parse the trimmed content of a ref blob into an [`ObjectId`].
+///
+/// Returns [`RefStoreError::Backend`] when the content is not a valid object id.
+fn parse_ref_oid(content: &str) -> Result<ObjectId, RefStoreError> {
+    let trimmed = content.trim();
+    trimmed
+        .parse::<ObjectId>()
+        .map_err(|_| RefStoreError::Backend(format!("invalid oid in ref: {}", trimmed)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A valid 40-char SHA-1 hex object id used across tests.
+    const VALID_OID_HEX: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
     fn test_cas_mode_variants() {
@@ -524,5 +545,80 @@ mod tests {
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.use_path_style, true);
         assert_eq!(config.cas_mode, CasMode::Native);
+    }
+
+    #[test]
+    fn test_object_key_with_prefix() {
+        let oid: ObjectId = VALID_OID_HEX.parse().unwrap();
+        let key = build_object_key("git", "acct1", &oid);
+        assert_eq!(
+            key,
+            "git/acct1/objects/01/23456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn test_object_key_empty_prefix() {
+        let oid: ObjectId = VALID_OID_HEX.parse().unwrap();
+        let key = build_object_key("", "acct1", &oid);
+        assert_eq!(
+            key,
+            "acct1/objects/01/23456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn test_object_key_trailing_slash_prefix() {
+        let oid: ObjectId = VALID_OID_HEX.parse().unwrap();
+        // A trailing slash on the prefix must not produce a double slash.
+        let key = build_object_key("git/", "acct1", &oid);
+        assert_eq!(
+            key,
+            "git/acct1/objects/01/23456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn test_ref_key_with_prefix() {
+        let key = build_ref_key("git", "acct1", "refs/heads/main");
+        assert_eq!(key, "git/acct1/refs/heads/main");
+    }
+
+    #[test]
+    fn test_ref_key_empty_prefix() {
+        let key = build_ref_key("", "acct1", "refs/heads/main");
+        assert_eq!(key, "acct1/refs/heads/main");
+    }
+
+    #[test]
+    fn test_ref_key_trailing_slash_prefix() {
+        let key = build_ref_key("git/", "acct1", "refs/heads/main");
+        assert_eq!(key, "git/acct1/refs/heads/main");
+    }
+
+    #[test]
+    fn test_parse_ref_oid_valid() {
+        let oid = parse_ref_oid(VALID_OID_HEX).unwrap();
+        assert_eq!(oid.to_hex().to_string(), VALID_OID_HEX);
+    }
+
+    #[test]
+    fn test_parse_ref_oid_valid_with_whitespace() {
+        // Ref blobs are commonly written with a trailing newline.
+        let oid = parse_ref_oid(&format!("  {}\n", VALID_OID_HEX)).unwrap();
+        assert_eq!(oid.to_hex().to_string(), VALID_OID_HEX);
+    }
+
+    #[test]
+    fn test_parse_ref_oid_invalid_non_hex() {
+        let err = parse_ref_oid("not-a-valid-oid").unwrap_err();
+        assert!(matches!(err, RefStoreError::Backend(_)));
+    }
+
+    #[test]
+    fn test_parse_ref_oid_invalid_wrong_length() {
+        // Valid hex but too short to be a SHA-1 object id.
+        let err = parse_ref_oid("0123abcd").unwrap_err();
+        assert!(matches!(err, RefStoreError::Backend(_)));
     }
 }

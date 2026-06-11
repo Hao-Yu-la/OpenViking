@@ -32,9 +32,8 @@ use ragfs::git::{CasMode, S3Config, S3ObjectStore, S3RefStore};
 /// - `local`: requires `[git.local]` with `base_dir`. Builds `LocalObjectStore`
 ///   and `LocalRefStore`, both rooted at `base_dir`.
 /// - `s3` (feature-gated): requires `[git.s3]` with `bucket`, `region`.
-///   `access_key_env` and `secret_key_env` are env-var names; their resolved
-///   values are passed to `S3Config`. If the env vars are set in config but
-///   missing in the process env, this returns a `PyValueError`.
+///   `access_key` and `secret_key` are read directly from the config; when
+///   omitted, the AWS SDK default credentials chain is used.
 pub fn build_git_service(
     cfg: &GitConfig,
     vfs: Arc<dyn FileSystem>,
@@ -82,22 +81,12 @@ fn build_s3_service(
         .as_ref()
         .ok_or_else(|| PyValueError::new_err("[git.s3] missing"))?;
 
-    let access_key_id = match sc.access_key_env.as_deref() {
-        Some(name) if !name.is_empty() => Some(std::env::var(name).map_err(|_| {
-            PyValueError::new_err(format!(
-                "access_key_env '{}' not set in process environment",
-                name
-            ))
-        })?),
+    let access_key_id = match sc.access_key.as_deref() {
+        Some(v) if !v.is_empty() => Some(v.to_string()),
         _ => None,
     };
-    let secret_access_key = match sc.secret_key_env.as_deref() {
-        Some(name) if !name.is_empty() => Some(std::env::var(name).map_err(|_| {
-            PyValueError::new_err(format!(
-                "secret_key_env '{}' not set in process environment",
-                name
-            ))
-        })?),
+    let secret_access_key = match sc.secret_key.as_deref() {
+        Some(v) if !v.is_empty() => Some(v.to_string()),
         _ => None,
     };
 

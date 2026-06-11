@@ -308,7 +308,16 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| Error::internal(format!("S3 GetObject error: {}", e)))?;
+            .map_err(|sdk_err| {
+                // Map a missing key (404 NoSuchKey) to NotFound so callers can
+                // distinguish it from a real service error, mirroring head_object.
+                let service_err = sdk_err.into_service_error();
+                if service_err.is_no_such_key() {
+                    Error::not_found(key.to_string())
+                } else {
+                    Error::internal(format!("S3 GetObject error: {}", service_err))
+                }
+            })?;
 
         let bytes = resp
             .body
@@ -340,7 +349,14 @@ impl S3Client {
             .range(range)
             .send()
             .await
-            .map_err(|e| Error::internal(format!("S3 GetObject range error: {}", e)))?;
+            .map_err(|sdk_err| {
+                let service_err = sdk_err.into_service_error();
+                if service_err.is_no_such_key() {
+                    Error::not_found(key.to_string())
+                } else {
+                    Error::internal(format!("S3 GetObject range error: {}", service_err))
+                }
+            })?;
 
         let bytes = resp
             .body
