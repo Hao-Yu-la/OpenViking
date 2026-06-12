@@ -70,7 +70,7 @@ class TestGitConfigOnOpenVikingConfig:
         assert cfg.git.local.base_dir == "/tmp/g"
         assert cfg.git.local.fsync == "on"
 
-    def test_git_config_round_trip_via_config_file(self, tmp_path, monkeypatch):
+    def test_git_config_round_trip_via_config_file(self, tmp_path):
         """Round-trip the new `git` section through the runtime JSON file loader."""
         from openviking_cli.utils.config.open_viking_config import (
             OpenVikingConfigSingleton,
