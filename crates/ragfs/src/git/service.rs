@@ -2,31 +2,53 @@
 //! VFS enumeration, tree building, and commit-object construction.
 //!
 //! See design §8.1 for the `commit()` algorithm. Fast Path 1 (persistent
-//! stat cache `commit_index.bin`) and Fast Path 3 (`exists()` dedup before
-//! blob write) are intentionally deferred — they are not necessary for
-//! correctness because `write_object` is idempotent.
+//! stat cache `commit_index.bin`) is wired through an optional
+//! `IndexStore`: when present and the cached snapshot's `parent_oid` matches
+//! the current branch HEAD, files whose `(size, mtime_ns)` match the cached
+//! entry skip the read+SHA-1 step and reuse the cached blob OID. Fast Path 3
+//! (`exists()` dedup before blob write) is intentionally deferred — it is
+//! not necessary for correctness because `write_object` is idempotent.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use gix_hash::ObjectId;
+use tracing::warn;
 
 use crate::core::filesystem::FileSystem;
+use crate::core::types::FileInfo;
 use crate::git::{
     error::{GitError, ObjectStoreError, RefStoreError},
+    index_store::{CommitIndex, IndexStore},
     object_store::ObjectStore,
     ref_store::RefStore,
-    types::{CommitRequest, CommitResponse, RestoreRequest, RestoreResponse, ShowRequest, ShowResponse},
+    types::{
+        CommitRequest, CommitResponse, IndexEntry, RestoreRequest, RestoreResponse, ShowRequest,
+        ShowResponse,
+    },
 };
 
 /// `GitService` orchestrates the full commit pipeline against a `FileSystem`
-/// (the working tree), an `ObjectStore`, and a `RefStore`.
+/// (the working tree), an `ObjectStore`, and a `RefStore`. An optional
+/// `IndexStore` enables Fast Path 1 — the persistent stat cache that lets
+/// `commit()` skip read+SHA-1 for files whose `(size, mtime_ns)` are
+/// unchanged since the last commit.
 pub struct GitService {
+    /// Working-tree filesystem rooted at `/local/{account}`.
     pub vfs: Arc<dyn FileSystem>,
+    /// Backing object store (loose Git objects, content-addressed).
     pub object_store: Arc<dyn ObjectStore>,
+    /// Backing ref store (branch heads).
     pub ref_store: Arc<dyn RefStore>,
+    /// Optional Fast Path 1 stat cache. `None` disables the optimization
+    /// — every commit then reads and SHA-1s every candidate file.
+    pub index_store: Option<Arc<dyn IndexStore>>,
 }
 
 impl GitService {
+    /// Build a service without Fast Path 1. Equivalent to
+    /// [`GitService::with_index`] passing `None`.
     pub fn new(
         vfs: Arc<dyn FileSystem>,
         object_store: Arc<dyn ObjectStore>,
@@ -36,6 +58,24 @@ impl GitService {
             vfs,
             object_store,
             ref_store,
+            index_store: None,
+        }
+    }
+
+    /// Build a service with an optional [`IndexStore`] backing Fast Path 1.
+    /// Pass `Some(...)` to enable the stat cache, `None` for parity with
+    /// [`GitService::new`].
+    pub fn with_index(
+        vfs: Arc<dyn FileSystem>,
+        object_store: Arc<dyn ObjectStore>,
+        ref_store: Arc<dyn RefStore>,
+        index_store: Option<Arc<dyn IndexStore>>,
+    ) -> Self {
+        Self {
+            vfs,
+            object_store,
+            ref_store,
+            index_store,
         }
     }
 
@@ -53,6 +93,13 @@ impl GitService {
     /// On a CAS conflict, returns `GitError::ConcurrentCommit` so the
     /// caller can decide whether to retry. There is intentionally no
     /// retry loop inside `commit()`.
+    ///
+    /// Fast Path 1: when an [`IndexStore`] is configured and the cached
+    /// snapshot's `parent_oid` matches `prev_head`, candidates whose
+    /// `(size, mtime_ns)` match the cached entry skip read+SHA-1 and reuse
+    /// the cached blob OID. Any cache miss / parent mismatch / decode
+    /// error silently falls back to the slow path; a stale or corrupt
+    /// index can never produce an incorrect commit.
     pub async fn commit(&self, req: CommitRequest) -> Result<CommitResponse, GitError> {
         let CommitRequest {
             account,
@@ -79,6 +126,25 @@ impl GitService {
             None => None,
         };
 
+        // 1b. Fast Path 1: load the persisted commit index for this branch
+        //     and verify its `parent_oid` matches `prev_head`. Any mismatch /
+        //     missing file / decode error → no cache for this commit.
+        let prev_index: Option<CommitIndex> = match (&self.index_store, prev_head) {
+            (Some(store), Some(head)) => match store.load(&account, &branch).await {
+                Ok(Some(idx)) if idx.parent_oid == head => Some(idx),
+                Ok(_) => None,
+                Err(e) => {
+                    warn!("commit index load failed for {account}/{branch}: {e}; \
+                           falling back to slow path");
+                    None
+                }
+            },
+            _ => None,
+        };
+        // Track whether Fast Path 1 is even potentially live: if disabled
+        // (`index_store` is None), we skip the new-index build below.
+        let fast_path_active = self.index_store.is_some() && prev_index.is_some();
+
         // 2. Build TreeEditor from prev tree if any; otherwise start empty.
         //    (The well-known empty-tree oid is not guaranteed to exist in the
         //    store, so we cannot blindly hand it to `from_tree`.)
@@ -93,13 +159,34 @@ impl GitService {
         };
 
         // 3. Determine candidate paths.
-        let candidates: Vec<String> = match paths {
+        let candidates: Vec<String> = match &paths {
             Some(ps) => ps
-                .into_iter()
+                .iter()
                 .filter(|p| !crate::git::enumerate::prune_path(p))
+                .cloned()
                 .collect(),
             None => crate::git::enumerate::collect_all(&self.vfs, &account).await?,
         };
+
+        // 3b. Seed the new index. For partial commits (paths=Some), unlisted
+        //     paths in the previous index must be preserved verbatim — they
+        //     were not enumerated this round, so the cache should keep them.
+        //     For full enumeration (paths=None), start empty: only paths seen
+        //     this commit end up in the new index.
+        let mut new_index_entries: HashMap<String, IndexEntry> =
+            match (self.index_store.is_some(), &paths, &prev_index) {
+                (true, Some(_), Some(idx)) => idx.entries.clone(),
+                (true, _, _) => HashMap::new(),
+                _ => HashMap::new(),
+            };
+        // For partial commits we still need to drop entries for any explicitly
+        // listed path before we re-fill it — otherwise a deleted path that
+        // was in the old index would linger.
+        if let Some(ps) = &paths {
+            for p in ps {
+                new_index_entries.remove(p);
+            }
+        }
 
         // 4. For each candidate: detect delete vs upsert. Unconditionally
         //    write blobs (write_object is idempotent — see Fast Path 3 note).
@@ -108,18 +195,34 @@ impl GitService {
             let abs = format!("/local/{}/{}", account, rel_path);
             match self.vfs.stat(&abs).await {
                 Ok(info) if info.is_dir => continue, // ignore directories
-                // TODO: dir↔file type transitions (path used to be a file,
-                // is now a directory or vice-versa) are not handled — the
-                // stale entry of the opposite kind lingers in the tree.
-                Ok(_) => {
-                    let bytes = self.vfs.read(&abs, 0, 0).await?;
-                    let oid = crate::git::util::write_object(
-                        self.object_store.as_ref(),
-                        &account,
-                        gix_object::Kind::Blob,
-                        &bytes,
-                    )
-                    .await?;
+                Ok(info) => {
+                    let stat = stat_signature(&info);
+
+                    // Fast Path 1: cached `(size, mtime_ns)` match → reuse oid,
+                    // skip vfs.read + write_object. The cached oid was once
+                    // written by a successful commit, so it's known good in
+                    // the object store.
+                    let cached = prev_index
+                        .as_ref()
+                        .and_then(|idx| idx.entries.get(&rel_path));
+                    let oid = match (cached, stat) {
+                        (Some(entry), Some((size, mtime_ns)))
+                            if entry.size == size && entry.mtime_ns == mtime_ns =>
+                        {
+                            entry.oid
+                        }
+                        _ => {
+                            let bytes = self.vfs.read(&abs, 0, 0).await?;
+                            crate::git::util::write_object(
+                                self.object_store.as_ref(),
+                                &account,
+                                gix_object::Kind::Blob,
+                                &bytes,
+                            )
+                            .await?
+                        }
+                    };
+
                     // Skip the upsert if prev_tree already has this exact
                     // path+oid — re-writing the same blob is not an editor
                     // change and shouldn't count toward the no-op decision.
@@ -133,11 +236,25 @@ impl GitService {
                         .await?,
                         None => None,
                     };
-                    if prev_entry.map(|(o, _)| o) == Some(oid) {
-                        continue;
+                    if prev_entry.map(|(o, _)| o) != Some(oid) {
+                        editor
+                            .upsert(self.object_store.as_ref(), &account, &rel_path, oid)
+                            .await?;
+                        changed += 1;
                     }
-                    editor.upsert(&rel_path, oid)?;
-                    changed += 1;
+
+                    // Record in the new index regardless of whether the editor
+                    // was touched — the on-disk file is still present and
+                    // its (size, mtime_ns, oid) is the new ground truth.
+                    if self.index_store.is_some() {
+                        if let Some((size, mtime_ns)) = stat {
+                            new_index_entries
+                                .insert(rel_path.clone(), IndexEntry { size, mtime_ns, oid });
+                        } else {
+                            // No usable mtime → don't poison the cache.
+                            new_index_entries.remove(&rel_path);
+                        }
+                    }
                 }
                 Err(e) if is_not_found(&e) => {
                     // Only count as a change if the path actually existed
@@ -155,18 +272,39 @@ impl GitService {
                         None => None,
                     };
                     if prev_entry.is_some() {
-                        editor.remove(&rel_path)?;
+                        editor
+                            .remove(self.object_store.as_ref(), &account, &rel_path)
+                            .await?;
                         changed += 1;
+                    }
+                    // Path is gone → drop any lingering cache entry.
+                    if self.index_store.is_some() {
+                        new_index_entries.remove(&rel_path);
                     }
                 }
                 Err(e) => return Err(e.into()),
             }
         }
 
-        // 5. No-op short-circuit.
+        // 5. No-op short-circuit. Even though the tree didn't change, the
+        //    on-disk (size, mtime_ns) for enumerated paths may have shifted
+        //    (e.g. `touch` of an unchanged file). Persist the refreshed index
+        //    keyed on the *current* HEAD so the next commit can still hit the
+        //    fast path. Soft-fail on save errors.
         if changed == 0 {
+            let noop_oid = prev_head.unwrap_or_else(|| ObjectId::null(gix_hash::Kind::Sha1));
+            if let (Some(store), Some(parent)) = (&self.index_store, prev_head) {
+                let new_index = CommitIndex {
+                    parent_oid: parent,
+                    entries: new_index_entries,
+                };
+                if let Err(e) = store.save(&account, &branch, &new_index).await {
+                    warn!("commit index save failed for {account}/{branch}: {e}");
+                }
+            }
+            let _ = fast_path_active;
             return Ok(CommitResponse::Noop {
-                commit_oid: prev_head.unwrap_or_else(|| ObjectId::null(gix_hash::Kind::Sha1)),
+                commit_oid: noop_oid,
             });
         }
 
@@ -200,6 +338,22 @@ impl GitService {
             }
             Err(other) => return Err(other.into()),
         }
+
+        // 8. Persist the new commit index. Soft-fail: a save error logs and
+        //    continues — the commit itself has already succeeded; the worst
+        //    case is one slow-path commit next time.
+        if let Some(store) = &self.index_store {
+            let new_index = CommitIndex {
+                parent_oid: commit_oid,
+                entries: new_index_entries,
+            };
+            if let Err(e) = store.save(&account, &branch, &new_index).await {
+                warn!("commit index save failed for {account}/{branch}: {e}");
+            }
+        }
+        // Suppress the "fast_path_active was set but never read" lint when no
+        // future code path inspects it; left in scope for diagnostics.
+        let _ = fast_path_active;
 
         Ok(CommitResponse::Created {
             commit_oid,
@@ -495,7 +649,14 @@ impl GitService {
             head_meta.tree,
         )
         .await?;
-        editor.upsert_subtree(project_dir, source_subtree)?;
+        editor
+            .upsert_subtree(
+                self.object_store.as_ref(),
+                account,
+                project_dir,
+                source_subtree,
+            )
+            .await?;
         let new_tree_oid = editor.write(self.object_store.as_ref(), account).await?;
 
         // 8. Construct the new commit. parent = head_oid (NOT source_oid).
@@ -755,6 +916,18 @@ fn actor_from_signature_ref(sig: &gix_actor::SignatureRef<'_>) -> crate::git::ty
 /// Return true iff `e` is `Error::NotFound(_)`.
 fn is_not_found(e: &crate::core::errors::Error) -> bool {
     matches!(e, crate::core::errors::Error::NotFound(_))
+}
+
+/// Project a `FileInfo` into the `(size, mtime_ns)` pair Fast Path 1 keys on.
+///
+/// Returns `None` when the file's `mod_time` is unrepresentable (pre-epoch
+/// times wider than `i128` can hold are degenerate). A `None` here means the
+/// path simply will not participate in Fast Path 1 — the slow path
+/// (read+SHA-1) is taken and the cache entry is dropped, never poisoned.
+fn stat_signature(info: &FileInfo) -> Option<(u64, i128)> {
+    let dur = info.mod_time.duration_since(UNIX_EPOCH).ok()?;
+    let nanos: i128 = dur.as_nanos() as i128;
+    Some((info.size, nanos))
 }
 
 /// Validate `project_dir` matches the rules of `TreeEditor::upsert`:
@@ -2747,6 +2920,406 @@ mod diff_tests {
     #[test]
     fn validate_accepts_single_segment() {
         validate_project_dir("resources").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fast_path1_tests {
+    //! Tests for Fast Path 1 (the persistent stat cache). The strategy:
+    //!   - Wrap `MockFsCounting` around a tiny in-memory map with controllable
+    //!     `mod_time` per path AND a `reads` counter.
+    //!   - Wrap `LocalIndexStore` in a temp dir as the index backend.
+    //!   - Run two commits and assert `reads` only goes up by the expected
+    //!     amount on the second one.
+    //!
+    //! Each assertion pins a distinct invariant of Fast Path 1: cache hit
+    //! skips read; (size, mtime_ns) mismatch invalidates; parent_oid mismatch
+    //! disables the cache; corruption is silent; partial-paths preserves
+    //! uncovered entries; deletion removes entries.
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use crate::core::errors::{Error, Result};
+    use crate::core::filesystem::FileSystem;
+    use crate::core::types::{FileInfo, TreeEntry, WriteFlag};
+    use crate::git::backends::local::{LocalIndexStore, LocalObjectStore, LocalRefStore};
+    use crate::git::index_store::IndexStore;
+
+    struct CountingVfs {
+        account: String,
+        // path -> (bytes, mtime_ns)
+        files: Arc<Mutex<HashMap<String, (Vec<u8>, i128)>>>,
+        reads: AtomicU64,
+    }
+
+    impl CountingVfs {
+        fn new(account: &str) -> Arc<Self> {
+            Arc::new(Self {
+                account: account.to_string(),
+                files: Arc::new(Mutex::new(HashMap::new())),
+                reads: AtomicU64::new(0),
+            })
+        }
+
+        fn put(&self, rel: &str, data: &[u8], mtime_ns: i128) {
+            let abs = format!("/local/{}/{}", self.account, rel);
+            self.files
+                .lock()
+                .unwrap()
+                .insert(abs, (data.to_vec(), mtime_ns));
+        }
+
+        fn delete(&self, rel: &str) {
+            let abs = format!("/local/{}/{}", self.account, rel);
+            self.files.lock().unwrap().remove(&abs);
+        }
+
+        fn reads(&self) -> u64 {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    fn nanos_to_systemtime(ns: i128) -> SystemTime {
+        // Tests use small positive nanos, so the cast is lossless.
+        let secs = (ns / 1_000_000_000) as u64;
+        let sub = (ns % 1_000_000_000) as u32;
+        UNIX_EPOCH + Duration::new(secs, sub)
+    }
+
+    #[async_trait]
+    impl FileSystem for CountingVfs {
+        async fn create(&self, _path: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn mkdir(&self, _path: &str, _mode: u32) -> Result<()> {
+            unimplemented!()
+        }
+        async fn remove(&self, path: &str) -> Result<()> {
+            self.files.lock().unwrap().remove(path);
+            Ok(())
+        }
+        async fn remove_all(&self, _path: &str) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn read(&self, path: &str, _offset: u64, _size: u64) -> Result<Vec<u8>> {
+            let g = self.files.lock().unwrap();
+            match g.get(path) {
+                Some((bytes, _)) => {
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(bytes.clone())
+                }
+                None => Err(Error::not_found(path)),
+            }
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            data: &[u8],
+            _offset: u64,
+            _flags: WriteFlag,
+        ) -> Result<u64> {
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), (data.to_vec(), 0));
+            Ok(data.len() as u64)
+        }
+        async fn read_dir(&self, _path: &str) -> Result<Vec<FileInfo>> {
+            unimplemented!()
+        }
+
+        async fn stat(&self, path: &str) -> Result<FileInfo> {
+            let g = self.files.lock().unwrap();
+            if let Some((bytes, mtime_ns)) = g.get(path) {
+                let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                return Ok(FileInfo::new(
+                    name,
+                    bytes.len() as u64,
+                    0o644,
+                    nanos_to_systemtime(*mtime_ns),
+                    false,
+                ));
+            }
+            Err(Error::not_found(path))
+        }
+
+        async fn rename(&self, _o: &str, _n: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn tree_directory(
+            &self,
+            path: &str,
+            _show_hidden: bool,
+            _node_limit: Option<usize>,
+            _level_limit: Option<usize>,
+        ) -> Result<Vec<TreeEntry>> {
+            let prefix = if path == "/" {
+                "/".to_string()
+            } else {
+                format!("{}/", path)
+            };
+            let g = self.files.lock().unwrap();
+            let mut out = Vec::new();
+            for (full_path, (_bytes, _mtime)) in g.iter() {
+                if !full_path.starts_with(&prefix) {
+                    continue;
+                }
+                let rel = full_path.strip_prefix(&prefix).unwrap_or(full_path).to_string();
+                let name = full_path.rsplit('/').next().unwrap_or(full_path).to_string();
+                out.push(TreeEntry {
+                    path: full_path.clone(),
+                    rel_path: rel,
+                    info: FileInfo::new_file(name, 0, 0o644),
+                    extra: HashMap::new(),
+                });
+            }
+            Ok(out)
+        }
+    }
+
+    fn make_service_with_index(
+        account: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<CountingVfs>,
+        Arc<LocalIndexStore>,
+        GitService,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(dir.path()));
+        let index_store = Arc::new(LocalIndexStore::new(dir.path()));
+        let vfs = CountingVfs::new(account);
+        let svc = GitService::with_index(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store as Arc<dyn ObjectStore>,
+            ref_store as Arc<dyn RefStore>,
+            Some(index_store.clone() as Arc<dyn IndexStore>),
+        );
+        (dir, vfs, index_store, svc)
+    }
+
+    fn make_service_no_index(
+        account: &str,
+    ) -> (tempfile::TempDir, Arc<CountingVfs>, GitService) {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = CountingVfs::new(account);
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store as Arc<dyn ObjectStore>,
+            ref_store as Arc<dyn RefStore>,
+        );
+        (dir, vfs, svc)
+    }
+
+    fn req(account: &str, branch: &str, paths: Option<Vec<String>>) -> CommitRequest {
+        CommitRequest {
+            account: account.to_string(),
+            branch: branch.to_string(),
+            message: "m".to_string(),
+            paths,
+            author_name: "tester".to_string(),
+            author_email: "t@x".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_stat_match_skips_read() {
+        // Two files. First commit reads both. Second commit, with
+        // identical (size, mtime_ns), reads NEITHER — Fast Path 1 hits.
+        let (_dir, vfs, _idx, svc) = make_service_with_index("acct");
+        vfs.put("a.md", b"hello", 1_000_000_000_000_000_000);
+        vfs.put("b.md", b"world", 2_000_000_000_000_000_000);
+
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        let reads_after_first = vfs.reads();
+        assert_eq!(reads_after_first, 2, "first commit must read both files");
+
+        // Second commit, no changes → Noop, but commit() still walks
+        // candidates and decides whether to read each. Fast Path 1 means
+        // (size, mtime_ns) match → no read needed.
+        let resp = svc.commit(req("acct", "main", None)).await.unwrap();
+        match resp {
+            CommitResponse::Noop { .. } => {}
+            other => panic!("expected Noop, got {other:?}"),
+        }
+        assert_eq!(
+            vfs.reads(),
+            reads_after_first,
+            "Fast Path 1 hit: no extra reads on second commit",
+        );
+    }
+
+    #[tokio::test]
+    async fn size_mismatch_invalidates_cache_entry() {
+        let (_dir, vfs, _idx, svc) = make_service_with_index("acct");
+        vfs.put("a.md", b"hello", 1_000_000_000_000_000_000);
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        let reads_after_first = vfs.reads();
+
+        // Same mtime, different size → Fast Path 1 must MISS for this file.
+        vfs.put("a.md", b"helloX", 1_000_000_000_000_000_000);
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        assert_eq!(
+            vfs.reads(),
+            reads_after_first + 1,
+            "size mismatch must trigger one extra read",
+        );
+    }
+
+    #[tokio::test]
+    async fn mtime_mismatch_invalidates_cache_entry() {
+        let (_dir, vfs, _idx, svc) = make_service_with_index("acct");
+        vfs.put("a.md", b"hello", 1_000_000_000_000_000_000);
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        let reads_after_first = vfs.reads();
+
+        // Same size, different mtime → cache miss.
+        vfs.put("a.md", b"hello", 2_000_000_000_000_000_000);
+        let resp = svc.commit(req("acct", "main", None)).await.unwrap();
+        // Same content → identical oid → no editor change → Noop.
+        match resp {
+            CommitResponse::Noop { .. } => {}
+            other => panic!("expected Noop, got {other:?}"),
+        }
+        assert_eq!(
+            vfs.reads(),
+            reads_after_first + 1,
+            "mtime mismatch must trigger one extra read",
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_oid_mismatch_disables_cache() {
+        // Build a service whose index file's parent_oid is stale relative
+        // to the branch HEAD: drop in a hand-crafted CommitIndex pointing at
+        // a bogus parent, then commit and assert ALL files were re-read.
+        let (dir, vfs, idx, svc) = make_service_with_index("acct");
+        vfs.put("a.md", b"hello", 1_000_000_000_000_000_000);
+        vfs.put("b.md", b"world", 2_000_000_000_000_000_000);
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        let reads_after_first = vfs.reads();
+
+        // Overwrite the index on disk with one whose parent_oid is bogus.
+        let bogus = ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+        let stale = CommitIndex {
+            parent_oid: bogus,
+            entries: HashMap::new(), // doesn't matter; whole file is rejected
+        };
+        idx.save("acct", "main", &stale).await.unwrap();
+        let _ = dir; // keep tempdir alive
+
+        // Re-commit with same contents. Cache parent_oid != HEAD → cache
+        // discarded entirely → both files re-read.
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        assert_eq!(
+            vfs.reads(),
+            reads_after_first + 2,
+            "parent_oid mismatch must force read of every candidate",
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_path_is_removed_from_index() {
+        let (_dir, vfs, idx, svc) = make_service_with_index("acct");
+        vfs.put("a.md", b"a", 1_000_000_000_000_000_000);
+        vfs.put("b.md", b"b", 2_000_000_000_000_000_000);
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+
+        // Delete a.md, commit with explicit paths so the deletion is
+        // observed. Commit succeeds; the persisted index must drop a.md
+        // and keep b.md.
+        vfs.delete("a.md");
+        let _ = svc
+            .commit(req("acct", "main", Some(vec!["a.md".into(), "b.md".into()])))
+            .await
+            .unwrap();
+
+        let saved = idx.load("acct", "main").await.unwrap().unwrap();
+        assert!(
+            !saved.entries.contains_key("a.md"),
+            "deleted path must be removed from the index",
+        );
+        assert!(
+            saved.entries.contains_key("b.md"),
+            "surviving path must remain in the index",
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_index_falls_back_silently() {
+        // Drop a malformed file at the index path BEFORE the first commit,
+        // then commit normally. The corrupt file makes load() return None,
+        // so commit takes the slow path — but it MUST still succeed and
+        // overwrite the corrupt file with a valid one.
+        let (dir, vfs, idx, svc) = make_service_with_index("acct");
+        let path = dir.path().join("acct").join("index").join("main.json");
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, b"NOT-JSON-AT-ALL").await.unwrap();
+
+        vfs.put("a.md", b"hi", 1_000_000_000_000_000_000);
+        let resp = svc.commit(req("acct", "main", None)).await.unwrap();
+        assert!(matches!(resp, CommitResponse::Created { .. }));
+        // The save after commit succeeded → load now returns a real index.
+        let loaded = idx.load("acct", "main").await.unwrap().unwrap();
+        assert!(loaded.entries.contains_key("a.md"));
+    }
+
+    #[tokio::test]
+    async fn partial_paths_preserves_uncovered_entries() {
+        // First commit covers a + b.
+        // Second commit lists ONLY [a]; b is never enumerated. The new
+        // index must still contain b's entry so a future full-enum commit
+        // can still hit the cache for b.
+        let (_dir, vfs, idx, svc) = make_service_with_index("acct");
+        vfs.put("a.md", b"a", 1_000_000_000_000_000_000);
+        vfs.put("b.md", b"b", 2_000_000_000_000_000_000);
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+
+        // Touch a (mtime change) — partial commit on a.md alone.
+        vfs.put("a.md", b"a", 3_000_000_000_000_000_000);
+        let _ = svc
+            .commit(req("acct", "main", Some(vec!["a.md".into()])))
+            .await
+            .unwrap();
+
+        let saved = idx.load("acct", "main").await.unwrap().unwrap();
+        let a = saved.entries.get("a.md").expect("a.md must be in the index");
+        let b = saved.entries.get("b.md").expect(
+            "b.md was uncovered by paths=[a.md] but must be preserved \
+             from the previous index",
+        );
+        assert_eq!(a.mtime_ns, 3_000_000_000_000_000_000);
+        assert_eq!(b.mtime_ns, 2_000_000_000_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn no_index_store_disables_fast_path() {
+        // Sanity: with index_store=None the slow path runs every commit;
+        // a noop second commit still reads every file.
+        let (_dir, vfs, svc) = make_service_no_index("acct");
+        vfs.put("a.md", b"hi", 1_000_000_000_000_000_000);
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        let reads_after_first = vfs.reads();
+
+        let _ = svc.commit(req("acct", "main", None)).await.unwrap();
+        assert_eq!(
+            vfs.reads(),
+            reads_after_first + 1,
+            "without an IndexStore the slow path runs every commit",
+        );
     }
 }
 

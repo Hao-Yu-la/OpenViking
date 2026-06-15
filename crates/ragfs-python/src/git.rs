@@ -17,11 +17,12 @@ use pyo3::prelude::*;
 
 use ragfs::core::FileSystem;
 use ragfs::git::{
-    GitConfig, GitService, LocalObjectStore, LocalRefStore, ObjectStore, RefStore,
+    GitConfig, GitService, IndexStore, LocalIndexStore, LocalObjectStore, LocalRefStore,
+    ObjectStore, RefStore,
 };
 
 #[cfg(feature = "s3")]
-use ragfs::git::{CasMode, S3Config, S3ObjectStore, S3RefStore};
+use ragfs::git::{CasMode, S3Config, S3IndexStore, S3ObjectStore, S3RefStore};
 
 /// Build a `GitService` from a `GitConfig` and the binding's MountableFS.
 ///
@@ -42,40 +43,57 @@ pub fn build_git_service(
         return Ok(None);
     }
 
-    let (object_store, ref_store): (Arc<dyn ObjectStore>, Arc<dyn RefStore>) =
-        match cfg.backend.as_str() {
-            "local" => {
-                let lc = cfg
-                    .local
-                    .as_ref()
-                    .ok_or_else(|| PyValueError::new_err("[git.local] missing"))?;
-                let os = Arc::new(LocalObjectStore::new(lc.base_dir.clone()));
-                let rs = Arc::new(LocalRefStore::new(lc.base_dir.clone()));
-                (os, rs)
-            }
-            #[cfg(feature = "s3")]
-            "s3" => build_s3_service(cfg)?,
-            #[cfg(not(feature = "s3"))]
-            "s3" => {
-                return Err(PyRuntimeError::new_err(
-                    "git backend 's3' requested but ragfs-python built without `s3` feature",
-                ));
-            }
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unsupported git backend: {}",
-                    other
-                )));
-            }
-        };
+    let (object_store, ref_store, index_store): (
+        Arc<dyn ObjectStore>,
+        Arc<dyn RefStore>,
+        Option<Arc<dyn IndexStore>>,
+    ) = match cfg.backend.as_str() {
+        "local" => {
+            let lc = cfg
+                .local
+                .as_ref()
+                .ok_or_else(|| PyValueError::new_err("[git.local] missing"))?;
+            let os = Arc::new(LocalObjectStore::new(lc.base_dir.clone()));
+            let rs = Arc::new(LocalRefStore::new(lc.base_dir.clone()));
+            let is: Option<Arc<dyn IndexStore>> = if cfg.tuning.commit_index_enabled {
+                Some(Arc::new(LocalIndexStore::new(lc.base_dir.clone())))
+            } else {
+                None
+            };
+            (os, rs, is)
+        }
+        #[cfg(feature = "s3")]
+        "s3" => build_s3_service(cfg)?,
+        #[cfg(not(feature = "s3"))]
+        "s3" => {
+            return Err(PyRuntimeError::new_err(
+                "git backend 's3' requested but ragfs-python built without `s3` feature",
+            ));
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported git backend: {}",
+                other
+            )));
+        }
+    };
 
-    Ok(Some(Arc::new(GitService::new(vfs, object_store, ref_store))))
+    Ok(Some(Arc::new(GitService::with_index(
+        vfs,
+        object_store,
+        ref_store,
+        index_store,
+    ))))
 }
 
 #[cfg(feature = "s3")]
 fn build_s3_service(
     cfg: &GitConfig,
-) -> PyResult<(Arc<dyn ObjectStore>, Arc<dyn RefStore>)> {
+) -> PyResult<(
+    Arc<dyn ObjectStore>,
+    Arc<dyn RefStore>,
+    Option<Arc<dyn IndexStore>>,
+)> {
     let sc = cfg
         .s3
         .as_ref()
@@ -125,13 +143,23 @@ fn build_s3_service(
             .map_err(|e| PyRuntimeError::new_err(format!("S3ObjectStore: {}", e)))?,
     ) as Arc<dyn ObjectStore>;
 
-    let rs_cfg = s3_config;
+    let rs_cfg = s3_config.clone();
     let ref_store = Arc::new(
         rt.block_on(async move { S3RefStore::from_config(rs_cfg).await })
             .map_err(|e| PyRuntimeError::new_err(format!("S3RefStore: {}", e)))?,
     ) as Arc<dyn RefStore>;
 
-    Ok((object_store, ref_store))
+    let index_store: Option<Arc<dyn IndexStore>> = if cfg.tuning.commit_index_enabled {
+        let is_cfg = s3_config;
+        Some(Arc::new(
+            rt.block_on(async move { S3IndexStore::from_config(is_cfg).await })
+                .map_err(|e| PyRuntimeError::new_err(format!("S3IndexStore: {}", e)))?,
+        ) as Arc<dyn IndexStore>)
+    } else {
+        None
+    };
+
+    Ok((object_store, ref_store, index_store))
 }
 
 /// Map a `GitError` to the appropriate Python exception.

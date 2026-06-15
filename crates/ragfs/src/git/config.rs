@@ -61,6 +61,12 @@ pub struct GitTuningConfig {
     pub ref_cas_max_retry: u32,
     #[serde(default = "default_ref_cas_backoff_ms")]
     pub ref_cas_backoff_ms: u64,
+    /// Enable Fast Path 1: skip read+SHA-1 for files whose `(size, mtime_ns)`
+    /// match the previous commit's persisted index. Defaults to `true`; set
+    /// to `false` to force the slow path on every commit (useful for tests
+    /// and for environments with unreliable mtimes).
+    #[serde(default = "default_true")]
+    pub commit_index_enabled: bool,
 }
 
 impl Default for GitTuningConfig {
@@ -70,6 +76,7 @@ impl Default for GitTuningConfig {
             restore_concurrency: default_restore_concurrency(),
             ref_cas_max_retry: default_ref_cas_max_retry(),
             ref_cas_backoff_ms: default_ref_cas_backoff_ms(),
+            commit_index_enabled: default_true(),
         }
     }
 }

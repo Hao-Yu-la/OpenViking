@@ -10,6 +10,7 @@ use gix_hash::ObjectId;
 use tokio::sync::Mutex;
 
 use crate::git::error::{ObjectStoreError, RefStoreError};
+use crate::git::index_store::{decode_index, encode_index, CommitIndex, IndexStore, IndexStoreError};
 use crate::git::object_store::ObjectStore;
 use crate::git::ref_store::RefStore;
 use crate::git::util::validate_ref_name;
@@ -227,6 +228,79 @@ impl RefStore for LocalRefStore {
     }
 }
 
+/// Local filesystem implementation of [`IndexStore`].
+///
+/// Persists each `(account, branch)` snapshot at
+/// `{base_dir}/{account}/index/{branch}.json`. The branch component is
+/// `validate_ref_name`-checked before any path is constructed to keep crafted
+/// names from escaping the per-account directory.
+///
+/// All errors degrade to `Ok(None)` on `load`: missing file, decode failure,
+/// version skew. Save uses tempfile + rename for atomicity, so a crash mid-
+/// write leaves the previous snapshot intact.
+pub struct LocalIndexStore {
+    base_dir: PathBuf,
+}
+
+impl LocalIndexStore {
+    /// Create a new `LocalIndexStore` rooted at `base_dir`. Per-account
+    /// subdirectories are created lazily on first save.
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+        }
+    }
+
+    fn index_path(&self, account: &str, branch: &str) -> PathBuf {
+        self.base_dir
+            .join(account)
+            .join("index")
+            .join(format!("{branch}.json"))
+    }
+}
+
+#[async_trait]
+impl IndexStore for LocalIndexStore {
+    async fn load(
+        &self,
+        account: &str,
+        branch: &str,
+    ) -> Result<Option<CommitIndex>, IndexStoreError> {
+        validate_ref_name(branch)
+            .map_err(|_| IndexStoreError::InvalidBranch(branch.to_string()))?;
+
+        let path = self.index_path(account, branch);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => match decode_index(&bytes) {
+                Ok(opt) => Ok(opt),
+                Err(_) => Ok(None),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn save(
+        &self,
+        account: &str,
+        branch: &str,
+        index: &CommitIndex,
+    ) -> Result<(), IndexStoreError> {
+        validate_ref_name(branch)
+            .map_err(|_| IndexStoreError::InvalidBranch(branch.to_string()))?;
+
+        let bytes = encode_index(index)?;
+        let path = self.index_path(account, branch);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let tmp_path = path.with_extension("tmp");
+        tokio::fs::write(&tmp_path, &bytes).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +401,66 @@ mod tests {
         for handle in handles {
             assert!(handle.await.unwrap());
         }
+    }
+
+    fn idx_oid(b: u8) -> ObjectId {
+        let mut bytes = [0u8; 20];
+        bytes.fill(b);
+        ObjectId::from_bytes_or_panic(&bytes)
+    }
+
+    #[tokio::test]
+    async fn local_index_store_round_trip() {
+        let dir = tempdir().unwrap();
+        let store = LocalIndexStore::new(dir.path());
+
+        // Missing → None
+        let loaded = store.load("acct", "main").await.unwrap();
+        assert!(loaded.is_none());
+
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            "resources/a.md".into(),
+            crate::git::types::IndexEntry {
+                size: 11,
+                mtime_ns: 1_700_000_000_000_000_000,
+                oid: idx_oid(0xAA),
+            },
+        );
+        let idx = crate::git::index_store::CommitIndex {
+            parent_oid: idx_oid(0xCC),
+            entries,
+        };
+
+        store.save("acct", "main", &idx).await.unwrap();
+        let loaded = store.load("acct", "main").await.unwrap().unwrap();
+        assert_eq!(loaded, idx);
+    }
+
+    #[tokio::test]
+    async fn local_index_store_corruption_is_soft_miss() {
+        let dir = tempdir().unwrap();
+        let store = LocalIndexStore::new(dir.path());
+
+        // Manually drop a malformed file at the expected path
+        let path = dir.path().join("acct").join("index").join("main.json");
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&path, b"definitely not json").await.unwrap();
+
+        // Should be Ok(None), not Err
+        assert!(store.load("acct", "main").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_index_store_rejects_invalid_branch() {
+        let dir = tempdir().unwrap();
+        let store = LocalIndexStore::new(dir.path());
+
+        // Path-traversal style branch name → InvalidBranch error
+        let result = store.load("acct", "../escape").await;
+        assert!(matches!(
+            result,
+            Err(crate::git::index_store::IndexStoreError::InvalidBranch(_))
+        ));
     }
 }

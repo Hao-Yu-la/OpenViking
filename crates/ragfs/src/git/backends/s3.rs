@@ -10,6 +10,9 @@ use bytes::Bytes;
 use gix_hash::ObjectId;
 
 use crate::git::error::{ObjectStoreError, RefStoreError};
+use crate::git::index_store::{
+    decode_index, encode_index, CommitIndex, IndexStore, IndexStoreError,
+};
 use crate::git::object_store::ObjectStore;
 use crate::git::ref_store::RefStore;
 use crate::git::util::validate_ref_name;
@@ -488,6 +491,127 @@ impl RefStore for S3RefStore {
     }
 }
 
+/// S3-backed implementation of [`IndexStore`].
+///
+/// Stores each `(account, branch)` snapshot at
+/// `{prefix}/{account}/index/{branch}.json`. The branch component is
+/// `validate_ref_name`-checked before any key is built, so crafted branch
+/// names cannot escape the per-account namespace.
+///
+/// Save uses a plain `put_object` (last-write-wins) — there is no CAS because
+/// the index is a soft-state cache and correctness is enforced at load time
+/// via the `parent_oid` check. Decode failures and `NoSuchKey` both surface
+/// as `Ok(None)` from `load`.
+pub struct S3IndexStore {
+    client: Arc<aws_sdk_s3::Client>,
+    bucket: String,
+    prefix: String,
+}
+
+impl S3IndexStore {
+    /// Create a new `S3IndexStore` from an existing S3 client.
+    pub fn new(client: Arc<aws_sdk_s3::Client>, bucket: String, prefix: String) -> Self {
+        Self {
+            client,
+            bucket,
+            prefix,
+        }
+    }
+
+    /// Create a new `S3IndexStore` from configuration. Reuses the same
+    /// credential / endpoint setup as [`S3ObjectStore::from_config`].
+    pub async fn from_config(config: S3Config) -> Result<Self, IndexStoreError> {
+        let mut s3_config_builder = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(config.region))
+            .force_path_style(config.use_path_style);
+
+        if let Some(ep) = config.endpoint {
+            s3_config_builder = s3_config_builder.endpoint_url(ep);
+        }
+
+        if let (Some(ak), Some(sk)) = (config.access_key_id, config.secret_access_key) {
+            let creds = Credentials::new(ak, sk, None, None, "ragfs-git");
+            s3_config_builder = s3_config_builder.credentials_provider(creds);
+        }
+
+        let s3_config = s3_config_builder.build();
+        let client = Arc::new(aws_sdk_s3::Client::from_conf(s3_config));
+
+        Ok(Self::new(client, config.bucket, config.prefix))
+    }
+
+    fn index_key(&self, account: &str, branch: &str) -> String {
+        build_index_key(&self.prefix, account, branch)
+    }
+}
+
+#[async_trait]
+impl IndexStore for S3IndexStore {
+    async fn load(
+        &self,
+        account: &str,
+        branch: &str,
+    ) -> Result<Option<CommitIndex>, IndexStoreError> {
+        validate_ref_name(branch)
+            .map_err(|_| IndexStoreError::InvalidBranch(branch.to_string()))?;
+
+        let key = self.index_key(account, branch);
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let bytes = resp
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|e| IndexStoreError::Backend(format!("S3 read body: {:?}", e)))?;
+                match decode_index(&bytes.to_vec()) {
+                    Ok(opt) => Ok(opt),
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(err) => {
+                let err_str = format!("{:?}", err);
+                if err_str.to_lowercase().contains("no_such_key")
+                    || err_str.to_lowercase().contains("404")
+                {
+                    Ok(None)
+                } else {
+                    Err(IndexStoreError::Backend(format!("S3 get error: {:?}", err)))
+                }
+            }
+        }
+    }
+
+    async fn save(
+        &self,
+        account: &str,
+        branch: &str,
+        index: &CommitIndex,
+    ) -> Result<(), IndexStoreError> {
+        validate_ref_name(branch)
+            .map_err(|_| IndexStoreError::InvalidBranch(branch.to_string()))?;
+
+        let bytes = encode_index(index)?;
+        let key = self.index_key(account, branch);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(bytes.into())
+            .send()
+            .await
+            .map_err(|e| IndexStoreError::Backend(format!("S3 put error: {:?}", e)))?;
+        Ok(())
+    }
+}
+
 /// Build the full S3 key for a Git object.
 ///
 /// Layout: `{prefix}/{account}/objects/{aa}/{bb..}` where `aa` is the first two
@@ -524,6 +648,19 @@ fn parse_ref_oid(content: &str) -> Result<ObjectId, RefStoreError> {
     trimmed
         .parse::<ObjectId>()
         .map_err(|_| RefStoreError::Backend(format!("invalid oid in ref: {}", trimmed)))
+}
+
+/// Build the full S3 key for a persisted commit index.
+///
+/// Layout: `{prefix}/{account}/index/{branch}.json`. When `prefix` is empty
+/// the leading segment is omitted. A trailing slash on `prefix` is ignored.
+fn build_index_key(prefix: &str, account: &str, branch: &str) -> String {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        format!("{}/index/{}.json", account, branch)
+    } else {
+        format!("{}/{}/index/{}.json", prefix, account, branch)
+    }
 }
 
 #[cfg(test)]
@@ -620,5 +757,23 @@ mod tests {
         // Valid hex but too short to be a SHA-1 object id.
         let err = parse_ref_oid("0123abcd").unwrap_err();
         assert!(matches!(err, RefStoreError::Backend(_)));
+    }
+
+    #[test]
+    fn test_index_key_with_prefix() {
+        let key = build_index_key("git", "acct1", "main");
+        assert_eq!(key, "git/acct1/index/main.json");
+    }
+
+    #[test]
+    fn test_index_key_empty_prefix() {
+        let key = build_index_key("", "acct1", "main");
+        assert_eq!(key, "acct1/index/main.json");
+    }
+
+    #[test]
+    fn test_index_key_trailing_slash_prefix() {
+        let key = build_index_key("git/", "acct1", "main");
+        assert_eq!(key, "git/acct1/index/main.json");
     }
 }
