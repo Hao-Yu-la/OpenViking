@@ -78,12 +78,10 @@ pub fn build_git_service(
         }
     };
 
-    Ok(Some(Arc::new(GitService::with_index(
-        vfs,
-        object_store,
-        ref_store,
-        index_store,
-    ))))
+    Ok(Some(Arc::new(
+        GitService::with_index(vfs, object_store, ref_store, index_store)
+            .with_blob_exists_precheck(cfg.tuning.blob_exists_precheck_enabled),
+    )))
 }
 
 #[cfg(feature = "s3")]

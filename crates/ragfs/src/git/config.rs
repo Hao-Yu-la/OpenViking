@@ -67,6 +67,12 @@ pub struct GitTuningConfig {
     /// and for environments with unreliable mtimes).
     #[serde(default = "default_true")]
     pub commit_index_enabled: bool,
+    /// Enable Fast Path 3: on the commit slow path, run an `exists()` precheck
+    /// before compressing and putting a blob, skipping the write when the
+    /// object already exists. Defaults to `true`. `put` is idempotent, so this
+    /// only affects backend call counts, never commit results.
+    #[serde(default = "default_true")]
+    pub blob_exists_precheck_enabled: bool,
 }
 
 impl Default for GitTuningConfig {
@@ -77,6 +83,7 @@ impl Default for GitTuningConfig {
             ref_cas_max_retry: default_ref_cas_max_retry(),
             ref_cas_backoff_ms: default_ref_cas_backoff_ms(),
             commit_index_enabled: default_true(),
+            blob_exists_precheck_enabled: default_true(),
         }
     }
 }
@@ -144,6 +151,8 @@ mod tests {
         assert_eq!(cfg.tuning.restore_concurrency, 32);
         assert_eq!(cfg.tuning.ref_cas_max_retry, 3);
         assert_eq!(cfg.tuning.ref_cas_backoff_ms, 50);
+        assert!(cfg.tuning.commit_index_enabled);
+        assert!(cfg.tuning.blob_exists_precheck_enabled);
     }
 
     #[test]

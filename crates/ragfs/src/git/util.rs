@@ -105,6 +105,30 @@ pub async fn write_object(
     Ok(oid)
 }
 
+/// Same as [`write_object`], but runs an `exists` precheck before compressing
+/// and putting (Fast Path 3). If the object is already present, the zlib
+/// compression and `put` are skipped and the oid is returned directly. `put`
+/// is itself idempotent, so this precheck is purely a performance optimization
+/// (saves S3 body upload / local zlib compression for duplicate blobs).
+pub async fn write_object_if_absent(
+    store: &dyn crate::git::object_store::ObjectStore,
+    account: &str,
+    kind: gix_object::Kind,
+    data: &[u8],
+) -> Result<gix_hash::ObjectId, crate::git::error::ObjectStoreError> {
+    let oid = gix_object::compute_hash(gix_hash::Kind::Sha1, kind, data);
+    if store.exists(account, &oid).await? {
+        return Ok(oid);
+    }
+    let header = gix_object::encode::loose_header(kind, data.len() as u64);
+    let mut full = Vec::with_capacity(header.len() + data.len());
+    full.extend_from_slice(&header);
+    full.extend_from_slice(data);
+    let compressed = zlib_compress(&full)?;
+    store.put(account, &oid, Bytes::from(compressed)).await?;
+    Ok(oid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +206,73 @@ mod tests {
         // Validate OID matches expected
         let expected_oid = gix_object::compute_hash(gix_hash::Kind::Sha1, kind, data);
         assert_eq!(oid, expected_oid);
+    }
+
+    #[tokio::test]
+    async fn test_write_object_if_absent_skips_put_on_second_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tempfile::tempdir;
+        use crate::git::backends::local::LocalObjectStore;
+        use crate::git::object_store::ObjectStore;
+        use crate::git::error::ObjectStoreError;
+        use gix_hash::ObjectId;
+
+        struct CountingStore {
+            inner: LocalObjectStore,
+            puts: AtomicUsize,
+            exists_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for CountingStore {
+            async fn put(
+                &self,
+                account: &str,
+                oid: &ObjectId,
+                zlib_body: Bytes,
+            ) -> Result<(), ObjectStoreError> {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+                self.inner.put(account, oid, zlib_body).await
+            }
+            async fn get(&self, account: &str, oid: &ObjectId) -> Result<Bytes, ObjectStoreError> {
+                self.inner.get(account, oid).await
+            }
+            async fn exists(&self, account: &str, oid: &ObjectId) -> Result<bool, ObjectStoreError> {
+                self.exists_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.exists(account, oid).await
+            }
+        }
+
+        let temp_dir = tempdir().unwrap();
+        let store = Arc::new(CountingStore {
+            inner: LocalObjectStore::new(temp_dir.path()),
+            puts: AtomicUsize::new(0),
+            exists_calls: AtomicUsize::new(0),
+        });
+
+        let data = b"duplicate blob content";
+        let kind = gix_object::Kind::Blob;
+
+        let oid1 = write_object_if_absent(store.as_ref(), "acct", kind, data)
+            .await
+            .unwrap();
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1);
+
+        // Second call with identical data: should hit exists and skip put.
+        let oid2 = write_object_if_absent(store.as_ref(), "acct", kind, data)
+            .await
+            .unwrap();
+        assert_eq!(oid1, oid2);
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1, "put must not be called again");
+        assert_eq!(store.exists_calls.load(Ordering::SeqCst), 2);
+
+        // Object is readable and oid matches compute_hash.
+        let raw = read_object(store.as_ref(), "acct", &oid1).await.unwrap();
+        let (parsed_kind, _size, offset) = parse_object_header(&raw).unwrap();
+        assert_eq!(parsed_kind, kind);
+        assert_eq!(&raw[offset..], data);
+        let expected = gix_object::compute_hash(gix_hash::Kind::Sha1, kind, data);
+        assert_eq!(oid1, expected);
     }
 }

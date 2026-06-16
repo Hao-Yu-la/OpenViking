@@ -477,6 +477,54 @@ pub async fn lookup(
     tree_oid: ObjectId,
     path: &str,
 ) -> Result<Option<(ObjectId, tree::EntryMode)>, GitError> {
+    let mut cache = TreeLookupCache::new();
+    lookup_cached(store, account, tree_oid, path, &mut cache).await
+}
+
+/// In-memory cache of decoded tree objects keyed by their OID. Intended for use
+/// across many `lookup_cached` calls that share the same root (e.g. the commit
+/// hot loop, where K candidate paths each walk depth-D ancestor trees that
+/// otherwise get re-fetched + re-zlib-decoded K×D times).
+///
+/// Entries are `Arc`-shared so a clone is cheap; the cache is single-writer
+/// (the caller's `&mut`) so no internal locking is needed.
+pub struct TreeLookupCache {
+    by_oid: HashMap<ObjectId, std::sync::Arc<TreeEntries>>,
+}
+
+impl TreeLookupCache {
+    /// Create an empty cache.
+    pub fn new() -> Self {
+        Self {
+            by_oid: HashMap::new(),
+        }
+    }
+
+    /// Pre-seed the cache with an already-decoded tree's entries. Useful when
+    /// the caller has the root entries on hand (e.g. from `TreeEditor::from_tree`)
+    /// and wants the very first `lookup_cached` to skip the redundant fetch.
+    pub fn seed(&mut self, oid: ObjectId, entries: TreeEntries) {
+        self.by_oid.insert(oid, std::sync::Arc::new(entries));
+    }
+}
+
+impl Default for TreeLookupCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Same as [`lookup`], but reuses an external [`TreeLookupCache`] across calls
+/// so each tree object is fetched + decoded at most once. The cache is keyed
+/// on the *content-addressed* tree OID, so it stays correct across calls with
+/// different starting roots.
+pub async fn lookup_cached(
+    store: &dyn ObjectStore,
+    account: &str,
+    tree_oid: ObjectId,
+    path: &str,
+    cache: &mut TreeLookupCache,
+) -> Result<Option<(ObjectId, tree::EntryMode)>, GitError> {
     if path.is_empty() {
         return Err(GitError::Other("empty path".into()));
     }
@@ -487,11 +535,20 @@ pub async fn lookup(
         if component.is_empty() {
             return Err(GitError::Other("empty path component".into()));
         }
-        let tree = load_tree(store, account, &current_oid).await?;
+        let entries = match cache.by_oid.get(&current_oid) {
+            Some(e) => e.clone(),
+            None => {
+                let loaded = std::sync::Arc::new(
+                    load_tree_entries(store, account, &current_oid).await?,
+                );
+                cache.by_oid.insert(current_oid, loaded.clone());
+                loaded
+            }
+        };
         let filename = component.as_bytes();
         let is_last = i == components.len() - 1;
 
-        match tree.entries.iter().find(|e| e.filename.as_bytes() == filename) {
+        match entries.get(filename.as_bstr()) {
             Some(entry) => {
                 if is_last {
                     return Ok(Some((entry.oid, entry.mode)));

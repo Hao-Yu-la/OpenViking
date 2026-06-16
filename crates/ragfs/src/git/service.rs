@@ -6,8 +6,11 @@
 //! `IndexStore`: when present and the cached snapshot's `parent_oid` matches
 //! the current branch HEAD, files whose `(size, mtime_ns)` match the cached
 //! entry skip the read+SHA-1 step and reuse the cached blob OID. Fast Path 3
-//! (`exists()` dedup before blob write) is intentionally deferred — it is
-//! not necessary for correctness because `write_object` is idempotent.
+//! (`exists()` dedup before blob write) is implemented in the slow path: after
+//! a blob's oid is computed, an `exists()` precheck skips the zlib compression
+//! and `put` when the object is already present. It is a pure performance
+//! optimization (`write_object` is idempotent) and can be toggled off via
+//! [`GitService::with_blob_exists_precheck`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +47,10 @@ pub struct GitService {
     /// Optional Fast Path 1 stat cache. `None` disables the optimization
     /// — every commit then reads and SHA-1s every candidate file.
     pub index_store: Option<Arc<dyn IndexStore>>,
+    /// Fast Path 3 toggle: when `true` (default), the slow path runs an
+    /// `exists()` precheck before compressing and putting a blob. Disable to
+    /// fall back to an unconditional `write_object`.
+    pub blob_exists_precheck: bool,
 }
 
 impl GitService {
@@ -59,6 +66,7 @@ impl GitService {
             object_store,
             ref_store,
             index_store: None,
+            blob_exists_precheck: true,
         }
     }
 
@@ -76,7 +84,16 @@ impl GitService {
             object_store,
             ref_store,
             index_store,
+            blob_exists_precheck: true,
         }
+    }
+
+    /// Toggle Fast Path 3 (`exists()` precheck before blob write). Defaults to
+    /// enabled; pass `false` to force an unconditional `write_object` on the
+    /// slow path.
+    pub fn with_blob_exists_precheck(mut self, enabled: bool) -> Self {
+        self.blob_exists_precheck = enabled;
+        self
     }
 
     /// Build a new commit on `branch` reflecting the current state of the
@@ -188,8 +205,20 @@ impl GitService {
             }
         }
 
-        // 4. For each candidate: detect delete vs upsert. Unconditionally
-        //    write blobs (write_object is idempotent — see Fast Path 3 note).
+        // 4. For each candidate: detect delete vs upsert. Blob writes on the
+        //    slow path go through Fast Path 3 (exists precheck) when enabled;
+        //    write_object is idempotent regardless.
+        //
+        //    `prev_lookup_cache` memoises decoded prev_tree subtree contents
+        //    keyed on tree OID, so K candidate paths sharing the same depth-D
+        //    ancestor chain pay D unique loads instead of K×D — every commit
+        //    in the same parent subtree only fetches each ancestor once.
+        //    Pre-seeded with the editor's root entries so the first
+        //    `lookup_cached` doesn't re-fetch what `from_tree` already decoded.
+        let mut prev_lookup_cache = crate::git::tree_builder::TreeLookupCache::new();
+        if let Some(t) = prev_tree {
+            prev_lookup_cache.seed(t, editor.root.clone());
+        }
         let mut changed = 0usize;
         for rel_path in candidates {
             let abs = format!("/local/{}/{}", account, rel_path);
@@ -213,13 +242,23 @@ impl GitService {
                         }
                         _ => {
                             let bytes = self.vfs.read(&abs, 0, 0).await?;
-                            crate::git::util::write_object(
-                                self.object_store.as_ref(),
-                                &account,
-                                gix_object::Kind::Blob,
-                                &bytes,
-                            )
-                            .await?
+                            if self.blob_exists_precheck {
+                                crate::git::util::write_object_if_absent(
+                                    self.object_store.as_ref(),
+                                    &account,
+                                    gix_object::Kind::Blob,
+                                    &bytes,
+                                )
+                                .await?
+                            } else {
+                                crate::git::util::write_object(
+                                    self.object_store.as_ref(),
+                                    &account,
+                                    gix_object::Kind::Blob,
+                                    &bytes,
+                                )
+                                .await?
+                            }
                         }
                     };
 
@@ -227,11 +266,12 @@ impl GitService {
                     // path+oid — re-writing the same blob is not an editor
                     // change and shouldn't count toward the no-op decision.
                     let prev_entry = match prev_tree {
-                        Some(t) => crate::git::tree_builder::lookup(
+                        Some(t) => crate::git::tree_builder::lookup_cached(
                             self.object_store.as_ref(),
                             &account,
                             t,
                             &rel_path,
+                            &mut prev_lookup_cache,
                         )
                         .await?,
                         None => None,
@@ -262,11 +302,12 @@ impl GitService {
                     // for missing paths. With no prev_tree (root commit) a
                     // missing path is just irrelevant.
                     let prev_entry = match prev_tree {
-                        Some(t) => crate::git::tree_builder::lookup(
+                        Some(t) => crate::git::tree_builder::lookup_cached(
                             self.object_store.as_ref(),
                             &account,
                             t,
                             &rel_path,
+                            &mut prev_lookup_cache,
                         )
                         .await?,
                         None => None,
@@ -2784,6 +2825,274 @@ mod tests {
             ShowResponse::Blob { bytes, .. } => assert_eq!(bytes.as_ref(), b"original"),
             other => panic!("expected Blob, got {other:?}"),
         }
+    }
+
+    // ── Fast Path 3: blob exists precheck ───────────────────────────────
+    /// ObjectStore wrapper that counts `put` / `exists` calls, delegating to
+    /// an inner `LocalObjectStore`.
+    struct CountingObjectStore {
+        inner: LocalObjectStore,
+        puts: std::sync::atomic::AtomicUsize,
+        exists_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingObjectStore {
+        async fn put(
+            &self,
+            account: &str,
+            oid: &ObjectId,
+            zlib_body: bytes::Bytes,
+        ) -> std::result::Result<(), ObjectStoreError> {
+            self.puts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put(account, oid, zlib_body).await
+        }
+        async fn get(
+            &self,
+            account: &str,
+            oid: &ObjectId,
+        ) -> std::result::Result<bytes::Bytes, ObjectStoreError> {
+            self.inner.get(account, oid).await
+        }
+        async fn exists(
+            &self,
+            account: &str,
+            oid: &ObjectId,
+        ) -> std::result::Result<bool, ObjectStoreError> {
+            self.exists_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.exists(account, oid).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_fast_path_3_skips_put_for_duplicate_blob() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(CountingObjectStore {
+            inner: LocalObjectStore::new(dir.path()),
+            puts: std::sync::atomic::AtomicUsize::new(0),
+            exists_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ref_store = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = MockVfs::new("acct");
+        // No index store → slow path runs → Fast Path 3 active (default on).
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            ref_store as Arc<dyn RefStore>,
+        );
+
+        vfs.put("a.md", b"dup");
+        svc.commit(req("acct", "main", "first", None)).await.unwrap();
+
+        // Commit a second file with identical content → same blob oid. The
+        // blob `put` must be skipped (exists hit); only the new root tree and
+        // commit object are written (2 puts, no blob put).
+        vfs.put("b.md", b"dup");
+        let puts_before = object_store.puts.load(Ordering::SeqCst);
+        let exists_before = object_store.exists_calls.load(Ordering::SeqCst);
+        svc.commit(req("acct", "main", "second", Some(vec!["b.md".into()])))
+            .await
+            .unwrap();
+        let put_delta = object_store.puts.load(Ordering::SeqCst) - puts_before;
+
+        // exists() was consulted on the second commit's slow path.
+        assert!(object_store.exists_calls.load(Ordering::SeqCst) > exists_before);
+        // Only tree + commit objects were put — the duplicate blob was skipped.
+        assert_eq!(put_delta, 2, "duplicate blob must not be re-put");
+    }
+
+    #[tokio::test]
+    async fn test_commit_fast_path_3_disabled_reputs_duplicate_blob() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(CountingObjectStore {
+            inner: LocalObjectStore::new(dir.path()),
+            puts: std::sync::atomic::AtomicUsize::new(0),
+            exists_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ref_store = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = MockVfs::new("acct");
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            ref_store as Arc<dyn RefStore>,
+        )
+        .with_blob_exists_precheck(false);
+
+        vfs.put("a.md", b"dup");
+        svc.commit(req("acct", "main", "first", None)).await.unwrap();
+        let exists_after_first = object_store.exists_calls.load(Ordering::SeqCst);
+
+        vfs.put("b.md", b"dup");
+        let puts_before = object_store.puts.load(Ordering::SeqCst);
+        svc.commit(req("acct", "main", "second", Some(vec!["b.md".into()])))
+            .await
+            .unwrap();
+
+        // With precheck off, the slow path calls write_object unconditionally
+        // → at least one put for the dup blob (idempotent at the backend).
+        assert!(object_store.puts.load(Ordering::SeqCst) > puts_before);
+        // And no extra exists() calls were issued from the blob write path on
+        // the second commit (precheck disabled). The backend's own put
+        // idempotency uses try_exists internally, not ObjectStore::exists.
+        assert_eq!(
+            object_store.exists_calls.load(Ordering::SeqCst),
+            exists_after_first
+        );
+
+        // Result correctness: both files resolve to the same content.
+        let show_b = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: Some("b.md".into()),
+            })
+            .await
+            .unwrap();
+        match show_b {
+            ShowResponse::Blob { bytes, .. } => assert_eq!(bytes.as_ref(), b"dup"),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    // ── prev_tree lookup cache: each ancestor tree loaded once per commit ──
+    /// ObjectStore wrapper that records every `get` oid so we can prove the
+    /// commit loop re-fetches each prev_tree subtree at most once.
+    struct GetSpyObjectStore {
+        inner: LocalObjectStore,
+        gets: std::sync::Mutex<Vec<ObjectId>>,
+    }
+
+    impl GetSpyObjectStore {
+        fn count_gets(&self, oid: &ObjectId) -> usize {
+            self.gets.lock().unwrap().iter().filter(|o| *o == oid).count()
+        }
+        fn reset(&self) {
+            self.gets.lock().unwrap().clear();
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GetSpyObjectStore {
+        async fn put(
+            &self,
+            account: &str,
+            oid: &ObjectId,
+            zlib_body: bytes::Bytes,
+        ) -> std::result::Result<(), ObjectStoreError> {
+            self.inner.put(account, oid, zlib_body).await
+        }
+        async fn get(
+            &self,
+            account: &str,
+            oid: &ObjectId,
+        ) -> std::result::Result<bytes::Bytes, ObjectStoreError> {
+            self.gets.lock().unwrap().push(*oid);
+            self.inner.get(account, oid).await
+        }
+        async fn exists(
+            &self,
+            account: &str,
+            oid: &ObjectId,
+        ) -> std::result::Result<bool, ObjectStoreError> {
+            self.inner.exists(account, oid).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_prev_tree_lookup_cache_amortises_ancestors() {
+        // Build a prev tree where many candidates share the same depth-3
+        // ancestor chain (root → resources → docs). Without the lookup cache,
+        // each candidate would re-fetch all three trees from object_store on
+        // its `lookup(prev_tree, ...)` call. With the cache, every ancestor
+        // along that chain is fetched at most once for the whole commit.
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(GetSpyObjectStore {
+            inner: LocalObjectStore::new(dir.path()),
+            gets: std::sync::Mutex::new(Vec::new()),
+        });
+        let ref_store = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = MockVfs::new("acct");
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            ref_store as Arc<dyn RefStore>,
+        );
+
+        // First commit: seed prev_tree with 5 files all under resources/docs/.
+        for name in ["a", "b", "c", "d", "e"] {
+            vfs.put(&format!("resources/docs/{}.md", name), name.as_bytes());
+        }
+        svc.commit(req("acct", "main", "seed", None)).await.unwrap();
+
+        // Capture root tree oid and its ancestor chain to resources/docs.
+        let head_resp = svc
+            .show(ShowRequest {
+                account: "acct".into(),
+                target_ref: "main".into(),
+                path: None,
+            })
+            .await
+            .unwrap();
+        let root_tree_oid = match head_resp {
+            ShowResponse::Commit { tree, .. } => tree,
+            _ => panic!("expected commit"),
+        };
+        // Resolve resources/docs tree oid by walking root once.
+        let mut cache = crate::git::tree_builder::TreeLookupCache::new();
+        let (resources_oid, _) = crate::git::tree_builder::lookup_cached(
+            object_store.as_ref(),
+            "acct",
+            root_tree_oid,
+            "resources",
+            &mut cache,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (docs_oid, _) = crate::git::tree_builder::lookup_cached(
+            object_store.as_ref(),
+            "acct",
+            root_tree_oid,
+            "resources/docs",
+            &mut cache,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Reset spy, then run a commit that touches all 5 candidates with the
+        // same content (so every Fast Path 1 miss path runs the prev lookup
+        // for the no-op skip check). The assertion proves each ancestor tree
+        // is fetched at most once across all 5 lookups.
+        object_store.reset();
+        let candidates: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|n| format!("resources/docs/{}.md", n))
+            .collect();
+        svc.commit(req("acct", "main", "rewrite", Some(candidates)))
+            .await
+            .unwrap();
+
+        // Each ancestor on the prev_tree chain was fetched at most once.
+        assert!(
+            object_store.count_gets(&root_tree_oid) <= 1,
+            "root tree was fetched {} times, expected ≤1 (cache miss)",
+            object_store.count_gets(&root_tree_oid)
+        );
+        assert!(
+            object_store.count_gets(&resources_oid) <= 1,
+            "resources tree was fetched {} times, expected ≤1 (cache miss)",
+            object_store.count_gets(&resources_oid)
+        );
+        assert!(
+            object_store.count_gets(&docs_oid) <= 1,
+            "resources/docs tree was fetched {} times, expected ≤1 (cache miss)",
+            object_store.count_gets(&docs_oid)
+        );
     }
 }
 

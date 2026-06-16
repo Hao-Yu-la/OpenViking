@@ -513,8 +513,8 @@ commit 主流程:**枚举 → 读 blob → 构建 tree → 构建 commit → CAS
 | 层级 | 触发条件 | 节省的开销 | 实现位置 |
 |------|----------|------------|----------|
 | **Fast Path 1**: Stat 索引复用 oid | 文件 (size, mtime_ns) 与 prev_index 完全一致 | 跳过 `vfs.read` + sha1 hash | **已实现**（`IndexStore` trait + `LocalIndexStore`/`S3IndexStore`,`CommitIndex` 与 `parent_oid` 绑定,索引 miss/decode 错误/parent 不匹配 → 静默回退 slow path;通过 `git.tuning.commit_index_enabled` 关闭） |
-| **Fast Path 2**: Tree 子树原样保留 | 子树下所有路径都没 upsert/remove | 跳过子树重 hash + 新 tree object 写入 | 已实现（`TreeEditor::from_tree` 惰性加载 root，未被 upsert/remove/upsert_subtree 触及的子树连读取+zlib 解压都省掉，由 `write_subtree` 的 `None` 分支原样复用其 OID） |
-| **Fast Path 3**: Blob CAS 去重 | 算出的 oid 在 object_store 已存在 | 跳过 zlib 压缩 + put_blob (本地写盘 / S3 PUT) | **MVP 未实现**(直接 put,依赖底层 `If-None-Match` / `try_exists` 短路;未在 service 层做 `exists` 预检) |
+| **Fast Path 2**: Tree 子树原样保留 | 子树下所有路径都没 upsert/remove | 跳过子树重 hash + 新 tree object 写入 | **已实现**（`TreeEditor::from_tree` 惰性加载 root，未被 upsert/remove/upsert_subtree 触及的子树连读取+zlib 解压都省掉，由 `write_subtree` 的 `None` 分支原样复用其 OID） |
+| **Fast Path 3**: Blob CAS 去重 | 算出的 oid 在 object_store 已存在 | 跳过 zlib 压缩 + put_blob (本地写盘 / S3 PUT) | **已实现**（slow path 写 blob 前在 service 层调用 `object_store.exists` 预检，命中则跳过 zlib 压缩与 `put`；范围严格限定 blob，tree/commit 不预检；通过 `git.tuning.blob_exists_precheck_enabled` 关闭） |
 
 ```rust
 // crates/ragfs/src/git/service.rs ::commit (节选)
@@ -1196,7 +1196,6 @@ current=commit_a]
 
 ### Rust 侧
 
-- **Fast Path 3 (blob exists 预检)** —— 文档 §8.1。service 层不调用 `object_store.exists` 预检,直接 `put`,依赖 local `try_exists` 与 S3 `If-None-Match` 的后端短路。
 - **commit / restore 内部 CAS 重试循环** —— 文档 §11.3 旧版描述。当前 `commit()` 明确不做 retry,`ConcurrentCommit` 直接上抛。
 - **git.tuning.* 配置项接入** —— 文档 §10.1。`upload_concurrency` / `restore_concurrency` / `ref_cas_max_retry` / `ref_cas_backoff_ms` 已在 `GitTuningConfig` 中定义并解析,但代码尚未读取(restore 回写并发度硬编码 32,commit blob 上传为串行)。
 - **S3 RedisLock CAS 模式** —— 文档 §7.2。`CasMode::RedisLock` 仅作为枚举占位,实际调用返回 "not yet implemented" 错误。
