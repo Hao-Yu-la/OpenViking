@@ -258,6 +258,7 @@ class VikingFS:
         self._bound_ctx: contextvars.ContextVar[Optional[RequestContext]] = contextvars.ContextVar(
             "vikingfs_bound_ctx", default=None
         )
+        self._background_tasks: set = set()
 
     @staticmethod
     def _default_ctx() -> RequestContext:
@@ -2831,15 +2832,18 @@ class VikingFS:
 
         Returns:
             Dict containing ``result`` (``"applied"`` / ``"noop"`` / ``"dry_run"``)
-            and corresponding oid / diff fields.
+            and corresponding oid / diff fields. When an ``Applied`` result has
+            vector side-effects, a ``task_id`` is included for polling the
+            background reindex via ``GET /api/v1/tasks/{task_id}``.
 
         After an ``Applied`` result, this method schedules background vector
         maintenance for the affected paths via :class:`ReindexExecutor`:
         directory markers (``.abstract.md`` / ``.overview.md``) recompute or
         delete only that directory's L0/L1 vector; source files reindex (write)
         or delete (removal) their DETAIL vector. ``.relations.json`` has no
-        vector side-effect. All scheduling is fire-and-forget; failures are
-        logged and do not block the return value.
+        vector side-effect. The rebuild is tracked as a single task
+        (``snapshot_restore_reindex``); per-path failures are logged and do not
+        block the return value.
         """
         real_ctx = self._ctx_or_default(ctx)
         account = real_ctx.account_id
@@ -2863,7 +2867,39 @@ class VikingFS:
         written = list(result.get("written_paths") or [])
         deleted = list(result.get("deleted_paths") or [])
         if written or deleted:
-            self._schedule_vector_rebuild(written=written, deleted=deleted, ctx=real_ctx)
+            tasks = self._collect_restore_vector_tasks(written, deleted)
+            if tasks:
+                try:
+                    from openviking.service.task_tracker import get_task_tracker
+
+                    tracker = get_task_tracker()
+                    task = await tracker.create(
+                        "snapshot_restore_reindex",
+                        resource_id=project_dir,
+                        account_id=real_ctx.account_id,
+                        user_id=real_ctx.user.user_id,
+                    )
+                    await tracker.update_stage(
+                        task.task_id,
+                        "queued",
+                        account_id=real_ctx.account_id,
+                        user_id=real_ctx.user.user_id,
+                    )
+                    background = asyncio.create_task(
+                        self._run_restore_rebuild_tracked(task.task_id, tasks, real_ctx),
+                        name=f"vikingfs-git-restore-reindex:{task.task_id}",
+                    )
+                    self._background_tasks.add(background)
+                    background.add_done_callback(self._background_tasks.discard)
+                    result["task_id"] = task.task_id
+                except Exception:
+                    logger.exception(
+                        "[VikingFS] git restore reindex task creation failed; "
+                        "falling back to fire-and-forget rebuild"
+                    )
+                    self._schedule_vector_rebuild(
+                        written=written, deleted=deleted, ctx=real_ctx
+                    )
         return result
 
     async def show(
@@ -2949,6 +2985,34 @@ class VikingFS:
             parents = commit.get("parents") or []
         return results
 
+    def _collect_restore_vector_tasks(
+        self,
+        written: List[str],
+        deleted: List[str],
+    ) -> set[tuple]:
+        """Classify restore-affected paths into deduplicated ``(op, uri, level)`` tasks.
+
+        Tasks are deduplicated on the exact ``(op, uri, level)`` key (no ancestor
+        subsumption — each change is handled independently because no operation
+        recurses into descendants).
+        """
+        tasks: set[tuple] = set()
+        for tree_path in written:
+            try:
+                task = self._classify_restore_path(tree_path, deleted=False)
+            except ValueError:
+                continue
+            if task is not None:
+                tasks.add(task)
+        for tree_path in deleted:
+            try:
+                task = self._classify_restore_path(tree_path, deleted=True)
+            except ValueError:
+                continue
+            if task is not None:
+                tasks.add(task)
+        return tasks
+
     def _schedule_vector_rebuild(
         self,
         *,
@@ -2967,10 +3031,7 @@ class VikingFS:
         - ``delete`` — remove only the ``(uri, level)`` vector (directory
           marker removal, or deleted source file).
 
-        Tasks are deduplicated on the exact ``(op, uri, level)`` key (no
-        ancestor subsumption — each change is handled independently because no
-        operation recurses into descendants). Failures are logged and never
-        propagate.
+        Failures are logged and never propagate.
         """
         try:
             from openviking.service.reindex_executor import get_reindex_executor
@@ -2986,22 +3047,7 @@ class VikingFS:
             )
             return
 
-        tasks: set[tuple] = set()
-        for tree_path in written:
-            try:
-                task = self._classify_restore_path(tree_path, deleted=False)
-            except ValueError:
-                continue
-            if task is not None:
-                tasks.add(task)
-        for tree_path in deleted:
-            try:
-                task = self._classify_restore_path(tree_path, deleted=True)
-            except ValueError:
-                continue
-            if task is not None:
-                tasks.add(task)
-
+        tasks = self._collect_restore_vector_tasks(written, deleted)
         if not tasks:
             return
 
@@ -3010,6 +3056,52 @@ class VikingFS:
             loop.create_task(
                 self._run_vector_rebuild(executor, op, uri, level, ctx),
                 name=f"vikingfs-git-{op}:{uri}:{int(level)}",
+            )
+
+    async def _run_restore_rebuild_tracked(
+        self,
+        task_id: str,
+        tasks: set[tuple],
+        ctx: RequestContext,
+    ) -> None:
+        """Background worker driving a tracked restore vector rebuild.
+
+        Runs all classified ``(op, uri, level)`` rebuild tasks concurrently and
+        drives the task through start → complete/fail. Per-task failures are
+        swallowed (and logged) inside :py:meth:`_run_vector_rebuild`, preserving
+        the "failures do not block" semantics.
+        """
+        from openviking.service.task_tracker import get_task_tracker
+
+        tracker = get_task_tracker()
+        await tracker.start(
+            task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            stage="reindexing",
+        )
+        try:
+            from openviking.service.reindex_executor import get_reindex_executor
+
+            executor = get_reindex_executor()
+            await asyncio.gather(
+                *[
+                    self._run_vector_rebuild(executor, op, uri, level, ctx)
+                    for (op, uri, level) in tasks
+                ]
+            )
+            await tracker.complete(
+                task_id,
+                {"status": "completed", "task_count": len(tasks)},
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
+        except Exception as exc:
+            await tracker.fail(
+                task_id,
+                str(exc),
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
             )
 
     async def _run_vector_rebuild(

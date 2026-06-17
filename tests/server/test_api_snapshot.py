@@ -232,11 +232,13 @@ async def test_restore_apply_triggers_reindex_hook(client_with_resource_and_blob
     assert restore_resp.status_code == 200, restore_resp.text
     assert restore_resp.json()["result"]["result"] == "applied"
 
-    # _schedule_vector_rebuild fires-and-forgets the executor task; give the
-    # event loop a couple of ticks to flush it.
+    # The restore reindex now runs in a tracked background task; poll a little
+    # to let start() + the gathered rebuild coroutines flush.
     import asyncio
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    for _ in range(100):
+        if calls:
+            break
+        await asyncio.sleep(0.02)
 
     assert calls, "expected at least one reindex call after restore apply"
 
@@ -286,8 +288,10 @@ async def test_restore_delete_removes_orphaned_vectors(client_with_resource_and_
     assert restore_resp.json()["result"]["result"] == "applied"
 
     import asyncio
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    for _ in range(100):
+        if (new_uri, 2) in deleted_calls:
+            break
+        await asyncio.sleep(0.02)
 
     assert (new_uri, 2) in deleted_calls, (
         f"deleted file's DETAIL vector must be purged; got {deleted_calls!r}"

@@ -728,3 +728,73 @@ async def test_restore_relations_json_has_no_vector_side_effect(vfs, monkeypatch
     await asyncio.sleep(0)
 
     assert spy.calls == []
+    # No vector side-effect -> no tracked task.
+    assert "task_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
+    """An applied restore with vector side-effects returns a ``task_id`` that
+    can be polled via the TaskTracker and reaches ``completed``.
+    """
+    spy = _SpyExecutor()
+
+    import openviking.service.reindex_executor as reindex_mod
+    monkeypatch.setattr(reindex_mod, "get_reindex_executor", lambda: spy)
+
+    from openviking.service.task_tracker import (
+        TaskTracker,
+        reset_task_tracker,
+        set_task_tracker,
+    )
+
+    class _MemTaskStore:
+        async def create(self, task):
+            return None
+
+        async def update(self, task):
+            return None
+
+        async def get(self, task_id, *, account_id=None, user_id=None):
+            return None
+
+        async def list(self, account_id, *, user_id=None):
+            return []
+
+        async def delete(self, task_id, *, account_id, user_id=None):
+            return None
+
+    set_task_tracker(TaskTracker(store=_MemTaskStore()))
+    try:
+        ctx = _make_ctx(account="acct_taskid")
+        await vfs.write_file("viking://resources/proj/x.md", b"v1", ctx=ctx)
+        c1 = await vfs.commit(message="v1", ctx=ctx)
+        await vfs.write_file("viking://resources/proj/x.md", b"v2", ctx=ctx)
+        await vfs.commit(message="v2", ctx=ctx)
+
+        result = await vfs.restore(
+            project_dir="viking://resources/proj",
+            source_commit=c1["commit_oid"],
+            ctx=ctx,
+        )
+        assert result["result"] == "applied"
+        task_id = result.get("task_id")
+        assert task_id
+
+        # Let the tracked background worker run to completion.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        from openviking.service.task_tracker import get_task_tracker
+
+        tracker = get_task_tracker()
+        task = await tracker.get(
+            task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
+        )
+        assert task is not None
+        assert task.task_type == "snapshot_restore_reindex"
+        assert task.status.value == "completed"
+        assert ("reindex_file", "viking://resources/proj/x.md") in spy.calls
+    finally:
+        reset_task_tracker()
+
