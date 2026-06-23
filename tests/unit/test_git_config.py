@@ -165,7 +165,6 @@ class TestGitS3ConfigParsing:
         assert s3.access_key is None
         assert s3.secret_key is None
         assert s3.cas_mode == "native"
-        assert s3.redis_lock_url is None
         assert s3.use_path_style is True
 
     def test_backend_s3_with_s3_section_ok(self):
@@ -208,6 +207,10 @@ class TestGitS3ConfigParsing:
         with pytest.raises(ValidationError):
             GitS3Config(cas_mode="invalid")
 
+    def test_redis_lock_cas_mode_rejected(self):
+        with pytest.raises(ValidationError):
+            GitS3Config(cas_mode="redis_lock")
+
 
 class TestBuildGitConfigDictS3:
     """A5.2 — _build_git_config_dict output for the s3 backend."""
@@ -248,14 +251,6 @@ class TestBuildGitConfigDictS3:
         out = self._build_s3()
         assert "access_key" not in out["s3"]
         assert "secret_key" not in out["s3"]
-
-    def test_redis_lock_url_omitted_when_none(self):
-        out = self._build_s3()
-        assert "redis_lock_url" not in out["s3"]
-
-    def test_redis_lock_url_emitted_when_present(self):
-        out = self._build_s3(cas_mode="redis_lock", redis_lock_url="redis://localhost:6379")
-        assert out["s3"]["redis_lock_url"] == "redis://localhost:6379"
 
     def test_missing_s3_section_raises(self):
         # Build a disabled config (skips model validation) then force s3=None to

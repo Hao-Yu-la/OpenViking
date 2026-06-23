@@ -52,14 +52,10 @@ class GitS3Config(BaseModel):
         description="S3 secret access key read directly from config. "
         "When empty, the SDK default credentials chain is used.",
     )
-    cas_mode: Literal["native", "redis_lock"] = Field(
+    cas_mode: Literal["native"] = Field(
         default="native",
-        description="Ref CAS mode. 'native' uses S3 conditional writes (If-Match); "
-        "'redis_lock' uses a distributed lock (not yet implemented in the backend).",
-    )
-    redis_lock_url: Optional[str] = Field(
-        default=None,
-        description="Redis URL used when cas_mode='redis_lock'.",
+        description="Ref CAS mode. 'native' uses S3 conditional writes (If-Match). "
+        "It is the only supported mode.",
     )
     use_path_style: bool = Field(
         default=True,

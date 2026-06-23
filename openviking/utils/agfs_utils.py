@@ -435,13 +435,10 @@ def _build_git_config_dict(git_config: Any, storage_path: Path) -> Dict[str, Any
         # to the SDK default credentials chain.
         access_key = getattr(s3_cfg, "access_key", None)
         secret_key = getattr(s3_cfg, "secret_key", None)
-        redis_lock_url = getattr(s3_cfg, "redis_lock_url", None)
         if access_key:
             s3_dict["access_key"] = access_key
         if secret_key:
             s3_dict["secret_key"] = secret_key
-        if redis_lock_url:
-            s3_dict["redis_lock_url"] = redis_lock_url
         result["s3"] = s3_dict
         return result
 

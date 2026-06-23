@@ -992,8 +992,7 @@ region            = "us-east-1"
 endpoint          = "https://s3.amazonaws.com"
 access_key_env    = "OV_S3_AK"     # 从环境变量读
 secret_key_env    = "OV_S3_SK"
-cas_mode          = "native"       # "native"(If-Match) | "redis_lock"(占位,未实现)
-redis_lock_url    = ""             # cas_mode=redis_lock 时必填(当前未实现)
+cas_mode          = "native"       # "native"(If-Match):当前唯一支持的模式
 use_path_style    = true           # path-style addressing(MinIO/LocalStack/TOS 默认开)
 
 # 高级调优(字段已在 config 中定义,但 MVP 部分尚未生效)
@@ -1212,7 +1211,7 @@ current=commit_a]
 
 | 风险                                     | 影响 | 缓解                                                                                  |
 | -------------------------------------- | -- | ----------------------------------------------------------------------------------- |
-| S3/TOS CAS 兼容性差异                       | 高  | POC 阶段验证目标后端;不支持时切换 `cas_mode = "redis_lock"`                                       |
+| S3/TOS CAS 兼容性差异                       | 高  | POC 阶段验证目标后端的 If-Match 条件写支持;不支持时该后端不可用于 git ref 存储                                       |
 | 大账号 commit 时 enumerate 慢               | 中  | `paths` 参数限定 scope;后续引入增量 diff(基于 mtime + parent tree)                              |
 | 双重加密导致 restore 后内容损坏                   | 高  | restore 路径绕过 `viking_fs.write` 加密,直接走 `MountableFS`;集成测试覆盖                          |
 | L0/L1 派生文件纳入版本历史,模型异步重建导致 commit 间差异增加 | 中  | 用户主动控制 commit 时机,不自动触发;L0/L1 文件通常较小(< 10KB),存储成本可控;如需降频可配置 commit 时忽略 mtime-only 变更 |
