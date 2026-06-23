@@ -1,6 +1,7 @@
 //! Local filesystem backend for Git object and ref storage
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,6 +17,10 @@ use crate::git::index_store::{
 use crate::git::object_store::ObjectStore;
 use crate::git::ref_store::RefStore;
 use crate::git::util::validate_ref_name;
+
+/// Per-process counter used to give each in-flight object write a unique temp
+/// filename, preventing concurrent `put` calls from sharing one `.tmp`.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Local filesystem implementation of ObjectStore.
 ///
@@ -65,12 +70,27 @@ impl ObjectStore for LocalObjectStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Write to temp file first, then rename for atomicity
-        let tmp_path = path.with_extension("tmp");
+        // Write to a unique temp file first, then rename for atomicity. A
+        // per-process counter keeps the temp name unique so concurrent `put`
+        // calls for the same not-yet-existing object don't share one `.tmp`
+        // and clobber each other mid-write.
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
         tokio::fs::write(&tmp_path, &zlib_body).await?;
-        tokio::fs::rename(&tmp_path, &path).await?;
-
-        Ok(())
+        match tokio::fs::rename(&tmp_path, &path).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // A racing `put` for the same object may have already produced
+                // it. Idempotency holds as long as the object exists, so treat
+                // that as success. Clean up our orphaned temp file regardless.
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                    Ok(())
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     async fn get(&self, account: &str, oid: &ObjectId) -> Result<Bytes, ObjectStoreError> {
@@ -345,6 +365,33 @@ mod tests {
 
         // Put again is idempotent
         store.put(account, &oid, body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_local_object_store_concurrent_put_same_oid() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(dir.path()));
+
+        let account = "test-account";
+        let oid = "0123456789abcdef0123456789abcdef01234567".parse::<ObjectId>().unwrap();
+        let body = Bytes::from("test content");
+
+        // Many concurrent puts for the same not-yet-existing object must all
+        // succeed: the unique temp name + rename-failure recheck preserves
+        // idempotency under the race.
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            let body = body.clone();
+            handles.push(tokio::spawn(async move {
+                store.put(account, &oid, body).await
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        assert_eq!(store.get(account, &oid).await.unwrap(), body);
     }
 
     #[tokio::test]

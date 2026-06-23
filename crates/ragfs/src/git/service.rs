@@ -636,8 +636,11 @@ impl GitService {
             });
         }
 
-        // 6. Read blob bytes for to_write entries, then writeback through VFS.
-        //    Paths in the diff are relative to project_dir — prefix here.
+        // 6. Prepare writeback metadata. Paths in the diff are relative to
+        //    project_dir — prefix here. NOTE: the VFS is NOT mutated yet. The
+        //    ref-consistency protocol (steps 7–9) must complete first so that a
+        //    losing CAS race leaves the working tree untouched; the actual
+        //    writeback happens in step 10 only after the ref swap succeeds.
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         let abs_prefix = match project_dir {
@@ -648,6 +651,71 @@ impl GitService {
         let deletes_planned = diff.to_delete.len();
         let unchanged_count = diff.unchanged.len();
 
+        // 7. Build the new tree: load head.tree into an editor and splice
+        //    source_subtree at project_dir, or use source tree directly if full restore.
+        let new_tree_oid = match project_dir {
+            Some(project_dir) => {
+                let mut editor = crate::git::tree_builder::TreeEditor::from_tree(
+                    self.object_store.as_ref(),
+                    account,
+                    head_meta.tree,
+                )
+                .await?;
+                editor
+                    .upsert_subtree(
+                        self.object_store.as_ref(),
+                        account,
+                        project_dir,
+                        source_tree_to_flatten,
+                    )
+                    .await?;
+                editor.write(self.object_store.as_ref(), account).await?
+            }
+            None => source_meta.tree,
+        };
+
+        // 8. Construct the new commit. parent = head_oid (NOT source_oid).
+        let msg = req.message.clone().unwrap_or_else(|| {
+            let short = &source_oid.to_hex().to_string()[..12.min(40)];
+            match &req.project_dir {
+                Some(project_dir) => format!("restore {} from {}", project_dir, short),
+                None => format!("restore full tree from {}", short),
+            }
+        });
+        let new_commit_oid = crate::git::commit::write_commit(
+            self.object_store.as_ref(),
+            account,
+            new_tree_oid,
+            vec![head_oid],
+            &req.author_name,
+            &req.author_email,
+            &msg,
+        )
+        .await?;
+
+        // 9. CAS-swap the branch ref. Map Conflict → ConcurrentCommit.
+        //    This MUST happen before any VFS writeback: if another commit
+        //    advanced the branch between our HEAD read and now, the CAS fails
+        //    and we return early with the working tree still matching HEAD,
+        //    leaving caller-driven reindex and on-disk state consistent.
+        match self
+            .ref_store
+            .cas_update(account, &ref_name, Some(head_oid), new_commit_oid)
+            .await
+        {
+            Ok(()) => {}
+            Err(crate::git::error::RefStoreError::Conflict { expected, actual }) => {
+                return Err(GitError::ConcurrentCommit {
+                    ref_name,
+                    expected,
+                    actual,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+
+        // 10. The ref swap committed our new state. Now write back through the
+        //     VFS so the working tree reflects the restored content.
         let object_store_ref = self.object_store.clone();
         let vfs_ref = self.vfs.clone();
         let account_owned = account.clone();
@@ -711,13 +779,13 @@ impl GitService {
             .try_collect::<()>()
             .await?;
 
-        // 6b. Prune directories left empty by the deletes above. Git does not
-        //     track directories, so `to_delete` only ever lists files; removing
-        //     the last file in a directory would otherwise leave an empty husk
-        //     in the VFS. Walk each deleted file's ancestor directories (within
-        //     project_dir, deepest first) and drop any that are now empty.
-        //     Best-effort: a directory that still holds entries, or has already
-        //     vanished, is simply skipped — pruning never aborts the restore.
+        // 10b. Prune directories left empty by the deletes above. Git does not
+        //      track directories, so `to_delete` only ever lists files; removing
+        //      the last file in a directory would otherwise leave an empty husk
+        //      in the VFS. Walk each deleted file's ancestor directories (within
+        //      project_dir, deepest first) and drop any that are now empty.
+        //      Best-effort: a directory that still holds entries, or has already
+        //      vanished, is simply skipped — pruning never aborts the restore.
         use std::collections::BTreeSet;
         // (depth, rel_dir): BTreeSet iterates ascending, so reversing yields the
         // deepest directories first — children are pruned before their parents,
@@ -749,65 +817,6 @@ impl GitService {
                 let _ =
                     crate::core::filesystem::FileSystem::remove(self.vfs.as_ref(), &abs).await;
             }
-        }
-
-        // 7. Build the new tree: load head.tree into an editor and splice
-        //    source_subtree at project_dir, or use source tree directly if full restore.
-        let new_tree_oid = match project_dir {
-            Some(project_dir) => {
-                let mut editor = crate::git::tree_builder::TreeEditor::from_tree(
-                    self.object_store.as_ref(),
-                    account,
-                    head_meta.tree,
-                )
-                .await?;
-                editor
-                    .upsert_subtree(
-                        self.object_store.as_ref(),
-                        account,
-                        project_dir,
-                        source_tree_to_flatten,
-                    )
-                    .await?;
-                editor.write(self.object_store.as_ref(), account).await?
-            }
-            None => source_meta.tree,
-        };
-
-        // 8. Construct the new commit. parent = head_oid (NOT source_oid).
-        let msg = req.message.clone().unwrap_or_else(|| {
-            let short = &source_oid.to_hex().to_string()[..12.min(40)];
-            match &req.project_dir {
-                Some(project_dir) => format!("restore {} from {}", project_dir, short),
-                None => format!("restore full tree from {}", short),
-            }
-        });
-        let new_commit_oid = crate::git::commit::write_commit(
-            self.object_store.as_ref(),
-            account,
-            new_tree_oid,
-            vec![head_oid],
-            &req.author_name,
-            &req.author_email,
-            &msg,
-        )
-        .await?;
-
-        // 9. CAS-swap the branch ref. Map Conflict → ConcurrentCommit.
-        match self
-            .ref_store
-            .cas_update(account, &ref_name, Some(head_oid), new_commit_oid)
-            .await
-        {
-            Ok(()) => {}
-            Err(crate::git::error::RefStoreError::Conflict { expected, actual }) => {
-                return Err(GitError::ConcurrentCommit {
-                    ref_name,
-                    expected,
-                    actual,
-                });
-            }
-            Err(other) => return Err(other.into()),
         }
 
         // Prefix diff paths with project_dir to produce account-relative paths (if not already account-relative).
@@ -3087,6 +3096,89 @@ mod tests {
             }
             other => panic!("expected ConcurrentCommit, got {other:?}"),
         }
+    }
+
+    /// Regression: a losing CAS race during restore must leave the VFS
+    /// byte-identical to its pre-restore (HEAD) state. The ref-consistency
+    /// protocol now runs before any writeback, so a `ConcurrentCommit` error
+    /// implies zero working-tree mutations — neither `to_write` content nor
+    /// `to_delete` removals are applied. This keeps the failed request, the
+    /// on-disk working tree, and the caller's reindex decision consistent.
+    #[tokio::test]
+    async fn test_restore_cas_conflict_leaves_vfs_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(dir.path()));
+        let inner_ref = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = MockVfs::new("acct");
+
+        let bootstrap_svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            inner_ref.clone() as Arc<dyn RefStore>,
+        );
+
+        // Source commit: a single file under the project dir.
+        vfs.put("resources/proj_a/a.md", b"v1");
+        let source_oid = make_commit(&bootstrap_svc, "acct", "main", "source").await;
+
+        // HEAD commit: a.md is modified (would be a `to_write`) and a brand new
+        // file is added (absent in source → would be a `to_delete` on restore).
+        vfs.put("resources/proj_a/a.md", b"v2");
+        vfs.put("resources/proj_a/b.md", b"new");
+        let head_oid = make_commit(&bootstrap_svc, "acct", "main", "head").await;
+
+        // Snapshot the working tree exactly as it stands at HEAD.
+        let before = vfs.files.lock().unwrap().clone();
+
+        // Force the first cas_update to conflict.
+        let bogus =
+            ObjectId::from_hex(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+        let conflict_ref = Arc::new(ConflictOnceRef {
+            inner: inner_ref.clone(),
+            fired: Mutex::new(false),
+            actual: Some(bogus),
+        });
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            conflict_ref as Arc<dyn RefStore>,
+        );
+
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: Some("resources/proj_a".into()),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: None,
+                author_name: "x".into(),
+                author_email: "x@x".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GitError::ConcurrentCommit { .. }),
+            "expected ConcurrentCommit, got {err:?}"
+        );
+
+        // The working tree must be untouched: a.md still v2 (not rewritten to
+        // v1) and b.md still present (not deleted).
+        let after = vfs.files.lock().unwrap().clone();
+        assert_eq!(after, before, "VFS must not change on a CAS conflict");
+        assert_eq!(
+            after.get("/local/acct/resources/proj_a/a.md").map(|v| v.as_slice()),
+            Some(b"v2".as_slice()),
+            "a.md must keep its HEAD content"
+        );
+        assert!(
+            after.contains_key("/local/acct/resources/proj_a/b.md"),
+            "b.md must not be deleted"
+        );
+
+        // And HEAD must still point at the original commit.
+        let head_now = inner_ref.read("acct", "refs/heads/main").await.unwrap();
+        assert_eq!(head_now, head_oid, "branch ref must be unchanged");
     }
 
     #[tokio::test]
