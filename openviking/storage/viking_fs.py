@@ -3536,6 +3536,7 @@ class VikingFS:
 
         from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
         from openviking.storage.transaction import LockContext, get_lock_manager
+        from openviking.pyagfs.exceptions import GitRestoreWritebackPartialError
 
         # Serialize the writeback against concurrent VFS mutations on the same
         # subtree. A scoped restore tree-locks project_dir; a full restore
@@ -3548,14 +3549,42 @@ class VikingFS:
             if project_dir is not None
             else f"/local/{account}"
         )
+        partial_exc: Optional[GitRestoreWritebackPartialError] = None
         try:
             async with LockContext(get_lock_manager(), [lock_path], lock_mode="tree"):
-                result = await self._async_agfs.run("git_restore", **kwargs)
+                try:
+                    result = await self._async_agfs.run("git_restore", **kwargs)
+                except GitRestoreWritebackPartialError as exc:
+                    # The ref already advanced — capture the exception and
+                    # finish the lock scope cleanly. Reindex scheduling and
+                    # re-raise happen below, outside the tree lock.
+                    partial_exc = exc
+                    result = None
         except LockAcquisitionError:
             raise ResourceBusyError(
                 f"Resource is being processed: {project_dir or '*'}",
                 uri=project_dir or "*",
             )
+
+        if partial_exc is not None:
+            # HEAD has moved forward but some VFS writes/deletes failed.
+            # Still schedule reindex for the paths that *did* reach the VFS so
+            # the vector index doesn't stay stale, then re-raise so the caller
+            # learns about the partial failure (and can inspect failed_writes
+            # / failed_deletes / task_id on the exception).
+            try:
+                partial_exc.task_id = await self._schedule_restore_reindex_for_paths(
+                    written_paths=partial_exc.written_paths,
+                    deleted_paths=partial_exc.deleted_paths,
+                    project_dir=project_dir,
+                    real_ctx=real_ctx,
+                )
+            except Exception:
+                logger.exception(
+                    "[VikingFS] git restore partial: reindex scheduling failed; "
+                    "HEAD advanced but reindex was not queued"
+                )
+            raise partial_exc
 
         if result.get("result") != "applied":
             return result
@@ -3563,40 +3592,68 @@ class VikingFS:
         written = list(result.get("written_paths") or [])
         deleted = list(result.get("deleted_paths") or [])
         if written or deleted:
-            tasks = self._collect_restore_vector_tasks(written, deleted)
-            if tasks:
-                try:
-                    from openviking.service.task_tracker import get_task_tracker
-
-                    tracker = get_task_tracker()
-                    task = await tracker.create(
-                        "snapshot_restore_reindex",
-                        resource_id=project_dir or "*",
-                        account_id=real_ctx.account_id,
-                        user_id=real_ctx.user.user_id,
-                    )
-                    await tracker.update_stage(
-                        task.task_id,
-                        "queued",
-                        account_id=real_ctx.account_id,
-                        user_id=real_ctx.user.user_id,
-                    )
-                    background = asyncio.create_task(
-                        self._run_restore_rebuild_tracked(task.task_id, tasks, real_ctx),
-                        name=f"vikingfs-git-restore-reindex:{task.task_id}",
-                    )
-                    self._background_tasks.add(background)
-                    background.add_done_callback(self._background_tasks.discard)
-                    result["task_id"] = task.task_id
-                except Exception:
-                    logger.exception(
-                        "[VikingFS] git restore reindex task creation failed; "
-                        "falling back to fire-and-forget rebuild"
-                    )
-                    self._schedule_vector_rebuild(
-                        written=written, deleted=deleted, ctx=real_ctx
-                    )
+            try:
+                task_id = await self._schedule_restore_reindex_for_paths(
+                    written_paths=written,
+                    deleted_paths=deleted,
+                    project_dir=project_dir,
+                    real_ctx=real_ctx,
+                )
+                if task_id is not None:
+                    result["task_id"] = task_id
+            except Exception:
+                logger.exception(
+                    "[VikingFS] git restore reindex task creation failed; "
+                    "falling back to fire-and-forget rebuild"
+                )
+                self._schedule_vector_rebuild(
+                    written=written, deleted=deleted, ctx=real_ctx
+                )
         return result
+
+    async def _schedule_restore_reindex_for_paths(
+        self,
+        *,
+        written_paths: List[str],
+        deleted_paths: List[str],
+        project_dir: Optional[str],
+        real_ctx: RequestContext,
+    ) -> Optional[str]:
+        """Classify ``written``/``deleted`` paths into vector tasks and queue
+        them as a single tracked background rebuild. Returns the task id, or
+        ``None`` if there is nothing to do.
+
+        Shared by the applied path and the partial-writeback recovery path —
+        both schedule reindex for paths that actually reached the VFS.
+        """
+        if not written_paths and not deleted_paths:
+            return None
+        tasks = self._collect_restore_vector_tasks(written_paths, deleted_paths)
+        if not tasks:
+            return None
+
+        from openviking.service.task_tracker import get_task_tracker
+
+        tracker = get_task_tracker()
+        task = await tracker.create(
+            "snapshot_restore_reindex",
+            resource_id=project_dir or "*",
+            account_id=real_ctx.account_id,
+            user_id=real_ctx.user.user_id,
+        )
+        await tracker.update_stage(
+            task.task_id,
+            "queued",
+            account_id=real_ctx.account_id,
+            user_id=real_ctx.user.user_id,
+        )
+        background = asyncio.create_task(
+            self._run_restore_rebuild_tracked(task.task_id, tasks, real_ctx),
+            name=f"vikingfs-git-restore-reindex:{task.task_id}",
+        )
+        self._background_tasks.add(background)
+        background.add_done_callback(self._background_tasks.discard)
+        return task.task_id
 
     async def show(
         self,

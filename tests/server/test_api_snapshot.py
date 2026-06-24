@@ -364,6 +364,59 @@ async def test_restore_concurrent_commit_returns_409(client_with_resource_and_bl
     assert body["error"]["code"] == "CONFLICT"
 
 
+async def test_restore_partial_writeback_surfaces_structured_error(
+    client_with_resource_and_blob, service, monkeypatch
+):
+    """When VikingFS.restore raises GitRestoreWritebackPartialError, the
+    router must turn it into an OpenVikingError(code='RESTORE_WRITEBACK_PARTIAL')
+    whose ``details`` carry the full payload (new_commit_oid, failed paths,
+    task_id) — NOT a generic InternalError.
+    """
+    from openviking.pyagfs.exceptions import GitRestoreWritebackPartialError
+
+    client, c1_oid, _blob_uri, _v1 = client_with_resource_and_blob
+
+    async def _raise_partial(self, *, message=None, **kwargs):
+        payload = {
+            "new_commit_oid": "f" * 40,
+            "source_commit": c1_oid,
+            "parent_commit": "e" * 40,
+            "written": 1,
+            "deleted": 0,
+            "unchanged": 0,
+            "written_paths": ["resources/ok.md"],
+            "deleted_paths": [],
+            "failed_writes": [("resources/bad.md", "vfs write boom")],
+            "failed_deletes": [],
+        }
+        exc = GitRestoreWritebackPartialError(
+            "restore writeback partial: 1 write(s) and 0 delete(s) failed",
+            payload=payload,
+        )
+        exc.task_id = "task-fixture-xyz"
+        raise exc
+
+    from openviking.storage.viking_fs import VikingFS
+
+    monkeypatch.setattr(VikingFS, "restore", _raise_partial)
+
+    resp = await client.post(
+        "/api/v1/snapshot/restore",
+        json={"project_dir": "viking://resources", "source_commit": c1_oid},
+    )
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "RESTORE_WRITEBACK_PARTIAL"
+    details = body["error"]["details"]
+    assert details["new_commit_oid"] == "f" * 40
+    assert details["task_id"] == "task-fixture-xyz"
+    assert details["written_paths"] == ["resources/ok.md"]
+    # failed_writes round-trips as list-of-list under JSON since to_dict
+    # serialises the tuples that way.
+    assert details["failed_writes"] == [["resources/bad.md", "vfs write boom"]]
+
+
 async def test_restore_rejects_unknown_field_per_pydantic_forbid(client_with_resource):
     """Pydantic ConfigDict(extra='forbid') on RestoreRequest must reject typo'd fields.
 

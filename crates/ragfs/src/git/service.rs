@@ -670,14 +670,12 @@ impl GitService {
         //    ref-consistency protocol (steps 7–9) must complete first so that a
         //    losing CAS race leaves the working tree untouched; the actual
         //    writeback happens in step 10 only after the ref swap succeeds.
-        use futures::stream::{self, StreamExt, TryStreamExt};
+        use futures::stream::{self, StreamExt};
 
         let abs_prefix = match project_dir {
             Some(project_dir) => format!("/local/{}/{}", account, project_dir),
             None => format!("/local/{}", account),
         };
-        let writes_planned = diff.to_write.len();
-        let deletes_planned = diff.to_delete.len();
         let unchanged_count = diff.unchanged.len();
 
         // 7. Build the new tree: load head.tree into an editor and splice
@@ -744,69 +742,98 @@ impl GitService {
         }
 
         // 10. The ref swap committed our new state. Now write back through the
-        //     VFS so the working tree reflects the restored content.
+        //     VFS so the working tree reflects the restored content. The ref
+        //     has already advanced, so a per-path failure here can NOT be
+        //     rolled back — instead the streams below collect every failure
+        //     and we surface them as `GitError::RestoreWritebackPartial`. The
+        //     caller (Python) then schedules reindex for the paths that *did*
+        //     reach the VFS so the vector index does not stay stale.
         let object_store_ref = self.object_store.clone();
         let vfs_ref = self.vfs.clone();
         let account_owned = account.clone();
         let abs_prefix_for_writes = abs_prefix.clone();
+        let project_dir_for_writes = project_dir.clone();
 
-        stream::iter(diff.to_write.clone().into_iter())
-            .map(|(rel, blob_oid)| {
-                let object_store = object_store_ref.clone();
-                let vfs = vfs_ref.clone();
-                let account = account_owned.clone();
-                let abs_prefix = abs_prefix_for_writes.clone();
-                async move {
-                    let bytes =
-                        read_blob_payload(object_store.as_ref(), &account, &blob_oid).await?;
-                    let abs = format!("{}/{}", abs_prefix, rel);
-                    // The target's parent directory may have been removed out of
-                    // band (e.g. an `rm -r` that a later commit recorded as a
-                    // deletion), so the restore must recreate the directory
-                    // chain before writing the blob back.
-                    crate::core::filesystem::FileSystem::ensure_parent_dirs(
-                        vfs.as_ref(),
-                        &abs,
-                        0o755,
-                    )
-                    .await?;
-                    crate::core::filesystem::FileSystem::write(
-                        vfs.as_ref(),
-                        &abs,
-                        &bytes,
-                        0,
-                        crate::core::types::WriteFlag::Create,
-                    )
-                    .await?;
-                    Ok::<(), GitError>(())
-                }
-            })
-            .buffer_unordered(32)
-            .try_collect::<()>()
-            .await?;
+        let write_results: Vec<(String, Result<(), GitError>)> =
+            stream::iter(diff.to_write.clone().into_iter())
+                .map(|(rel, blob_oid)| {
+                    let object_store = object_store_ref.clone();
+                    let vfs = vfs_ref.clone();
+                    let account = account_owned.clone();
+                    let abs_prefix = abs_prefix_for_writes.clone();
+                    let project_dir = project_dir_for_writes.clone();
+                    async move {
+                        let account_rel = match &project_dir {
+                            Some(pd) => format!("{}/{}", pd, rel),
+                            None => rel.clone(),
+                        };
+                        let r = async {
+                            let bytes =
+                                read_blob_payload(object_store.as_ref(), &account, &blob_oid).await?;
+                            let abs = format!("{}/{}", abs_prefix, rel);
+                            // The target's parent directory may have been removed out of
+                            // band (e.g. an `rm -r` that a later commit recorded as a
+                            // deletion), so the restore must recreate the directory
+                            // chain before writing the blob back.
+                            crate::core::filesystem::FileSystem::ensure_parent_dirs(
+                                vfs.as_ref(),
+                                &abs,
+                                0o755,
+                            )
+                            .await?;
+                            crate::core::filesystem::FileSystem::write(
+                                vfs.as_ref(),
+                                &abs,
+                                &bytes,
+                                0,
+                                crate::core::types::WriteFlag::Create,
+                            )
+                            .await?;
+                            Ok::<(), GitError>(())
+                        }
+                        .await;
+                        (account_rel, r)
+                    }
+                })
+                .buffer_unordered(32)
+                .collect()
+                .await;
 
         let abs_prefix_for_deletes = abs_prefix.clone();
         let vfs_for_deletes = self.vfs.clone();
-        stream::iter(diff.to_delete.clone().into_iter())
-            .map(|rel| {
-                let vfs = vfs_for_deletes.clone();
-                let abs_prefix = abs_prefix_for_deletes.clone();
-                async move {
-                    let abs = format!("{}/{}", abs_prefix, rel);
-                    // Restore is idempotent: a path the diff wants to delete may
-                    // already be absent from the VFS (e.g. derived files like
-                    // `.abstract.md` that were removed or regenerated out of band).
-                    // Treat NotFound as success rather than aborting the restore.
-                    match crate::core::filesystem::FileSystem::remove(vfs.as_ref(), &abs).await {
-                        Ok(_) => Ok::<(), GitError>(()),
-                        Err(crate::core::errors::Error::NotFound(_)) => Ok(()),
-                        Err(e) => Err(e.into()),
+        let project_dir_for_deletes = project_dir.clone();
+        let delete_results: Vec<(String, Result<(), GitError>)> =
+            stream::iter(diff.to_delete.clone().into_iter())
+                .map(|rel| {
+                    let vfs = vfs_for_deletes.clone();
+                    let abs_prefix = abs_prefix_for_deletes.clone();
+                    let project_dir = project_dir_for_deletes.clone();
+                    async move {
+                        let account_rel = match &project_dir {
+                            Some(pd) => format!("{}/{}", pd, rel),
+                            None => rel.clone(),
+                        };
+                        let abs = format!("{}/{}", abs_prefix, rel);
+                        // Restore is idempotent: a path the diff wants to delete may
+                        // already be absent from the VFS (e.g. derived files like
+                        // `.abstract.md` that were removed or regenerated out of band).
+                        // Treat NotFound as success rather than counting it as a failure.
+                        let r = match crate::core::filesystem::FileSystem::remove(
+                            vfs.as_ref(),
+                            &abs,
+                        )
+                        .await
+                        {
+                            Ok(_) => Ok::<(), GitError>(()),
+                            Err(crate::core::errors::Error::NotFound(_)) => Ok(()),
+                            Err(e) => Err(e.into()),
+                        };
+                        (account_rel, r)
                     }
-                }
-            })
-            .buffer_unordered(32)
-            .try_collect::<()>()
-            .await?;
+                })
+                .buffer_unordered(32)
+                .collect()
+                .await;
 
         // 10b. Prune directories left empty by the deletes above. Git does not
         //      track directories, so `to_delete` only ever lists files; removing
@@ -848,30 +875,58 @@ impl GitService {
             }
         }
 
-        // Prefix diff paths with project_dir to produce account-relative paths (if not already account-relative).
-        let written_paths: Vec<String> = diff
-            .to_write
-            .iter()
-            .map(|(rel, _)| match project_dir {
-                Some(project_dir) => format!("{}/{}", project_dir, rel),
-                None => rel.clone(),
-            })
-            .collect();
-        let deleted_paths: Vec<String> = diff
-            .to_delete
-            .iter()
-            .map(|rel| match project_dir {
-                Some(project_dir) => format!("{}/{}", project_dir, rel),
-                None => rel.clone(),
-            })
-            .collect();
+        // 10c. Partition the per-path results into success / failure buckets.
+        //      `written_paths` / `deleted_paths` here only carry the paths
+        //      that actually reached the VFS — callers use these lists to
+        //      drive reindex, and a path whose write failed must not be
+        //      reindexed (the file's blob never landed).
+        let mut written_paths: Vec<String> = Vec::with_capacity(write_results.len());
+        let mut failed_writes: Vec<(String, String)> = Vec::new();
+        for (path, r) in write_results {
+            match r {
+                Ok(()) => written_paths.push(path),
+                Err(e) => failed_writes.push((path, e.to_string())),
+            }
+        }
+        let mut deleted_paths: Vec<String> = Vec::with_capacity(delete_results.len());
+        let mut failed_deletes: Vec<(String, String)> = Vec::new();
+        for (path, r) in delete_results {
+            match r {
+                Ok(()) => deleted_paths.push(path),
+                Err(e) => failed_deletes.push((path, e.to_string())),
+            }
+        }
+
+        let written_actual = written_paths.len();
+        let deleted_actual = deleted_paths.len();
+
+        // 11. Partial failure path. The ref has already advanced, so we
+        //     cannot rollback — surface a structured error carrying enough
+        //     payload for the caller to schedule reindex for the paths that
+        //     *did* succeed and to report the failures upward.
+        if !failed_writes.is_empty() || !failed_deletes.is_empty() {
+            return Err(GitError::RestoreWritebackPartial(Box::new(
+                crate::git::types::RestoreWritebackPartial {
+                    new_commit_oid,
+                    source_commit: source_oid,
+                    parent_commit: head_oid,
+                    written: written_actual,
+                    deleted: deleted_actual,
+                    unchanged: unchanged_count,
+                    written_paths,
+                    deleted_paths,
+                    failed_writes,
+                    failed_deletes,
+                },
+            )));
+        }
 
         Ok(RestoreResponse::Applied {
             new_commit_oid,
             source_commit: source_oid,
             parent_commit: head_oid,
-            written: writes_planned,
-            deleted: deletes_planned,
+            written: written_actual,
+            deleted: deleted_actual,
             unchanged: unchanged_count,
             written_paths,
             deleted_paths,
@@ -1190,7 +1245,7 @@ fn compute_subtree_diff(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     use crate::core::errors::{Error, Result};
@@ -1211,6 +1266,15 @@ mod tests {
         /// VFS) instead of silently succeeding. Used to exercise the idempotent
         /// delete path in restore.
         strict_remove: bool,
+        /// Absolute paths whose `write` call should fail with an I/O error.
+        /// Used by restore-partial tests to force a per-path writeback failure
+        /// without otherwise breaking the mock VFS.
+        fail_writes: Arc<Mutex<HashSet<String>>>,
+        /// Absolute paths whose `remove` call should fail with an I/O error
+        /// (NotFound-style errors are still produced by the existing
+        /// `strict_remove` flag, not via this set — that mirrors the real
+        /// "idempotent delete" semantics in service.rs).
+        fail_removes: Arc<Mutex<HashSet<String>>>,
     }
 
     impl MockVfs {
@@ -1219,6 +1283,8 @@ mod tests {
                 account: account.to_string(),
                 files: Arc::new(Mutex::new(HashMap::new())),
                 strict_remove: false,
+                fail_writes: Arc::new(Mutex::new(HashSet::new())),
+                fail_removes: Arc::new(Mutex::new(HashSet::new())),
             })
         }
 
@@ -1227,6 +1293,8 @@ mod tests {
                 account: account.to_string(),
                 files: Arc::new(Mutex::new(HashMap::new())),
                 strict_remove: true,
+                fail_writes: Arc::new(Mutex::new(HashSet::new())),
+                fail_removes: Arc::new(Mutex::new(HashSet::new())),
             })
         }
 
@@ -1240,6 +1308,20 @@ mod tests {
         fn delete(&self, rel: &str) {
             let abs = format!("/local/{}/{}", self.account, rel);
             self.files.lock().unwrap().remove(&abs);
+        }
+
+        /// Cause subsequent `write` calls targeting `rel` (account-relative)
+        /// to return an I/O error.
+        fn fail_write(&self, rel: &str) {
+            let abs = format!("/local/{}/{}", self.account, rel);
+            self.fail_writes.lock().unwrap().insert(abs);
+        }
+
+        /// Cause subsequent `remove` calls targeting `rel` (account-relative)
+        /// to return an I/O error.
+        fn fail_remove(&self, rel: &str) {
+            let abs = format!("/local/{}/{}", self.account, rel);
+            self.fail_removes.lock().unwrap().insert(abs);
         }
     }
 
@@ -1255,6 +1337,9 @@ mod tests {
             Ok(())
         }
         async fn remove(&self, path: &str) -> Result<()> {
+            if self.fail_removes.lock().unwrap().contains(path) {
+                return Err(Error::Internal(format!("forced remove failure: {path}")));
+            }
             let existed = self.files.lock().unwrap().remove(path).is_some();
             if self.strict_remove && !existed {
                 return Err(Error::not_found(path));
@@ -1280,6 +1365,9 @@ mod tests {
             _offset: u64,
             _flags: WriteFlag,
         ) -> Result<u64> {
+            if self.fail_writes.lock().unwrap().contains(path) {
+                return Err(Error::Internal(format!("forced write failure: {path}")));
+            }
             self.files
                 .lock()
                 .unwrap()
@@ -2592,6 +2680,290 @@ mod tests {
             !files.contains_key("/local/acct/resources/proj_a/c.md"),
             "c.md deleted",
         );
+    }
+
+    // Partial-writeback regression suite. Before this fix, a single failed
+    // `FileSystem::write` (or non-NotFound `remove`) during step 10 would let
+    // the ref keep pointing at the new commit while `try_collect` short-
+    // circuited the rest of the writeback. The caller then saw a generic
+    // RuntimeError and never scheduled reindex, leaving HEAD and the working
+    // tree (and any vector index) inconsistent. These tests pin the new
+    // behavior: every per-path op runs to completion and partial failures
+    // surface as a structured `GitError::RestoreWritebackPartial`.
+
+    /// A forced write failure for one path must produce
+    /// `GitError::RestoreWritebackPartial` whose payload still reports the
+    /// other writes/deletes as succeeded so the caller can reindex them.
+    #[tokio::test]
+    async fn test_restore_writeback_partial_returns_partial_error_on_write_failure() {
+        let (_dir, vfs, _object_store, ref_store, svc) = make_service("acct");
+        // Source: two files at v1.
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        vfs.put("resources/proj_a/b.md", b"B v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        // HEAD diverges: a.md updated, b.md updated, c.md added.
+        vfs.put("resources/proj_a/a.md", b"A v2");
+        vfs.put("resources/proj_a/b.md", b"B v2");
+        vfs.put("resources/proj_a/c.md", b"C new");
+        let _head_oid = match svc
+            .commit(req(
+                "acct",
+                "main",
+                "head",
+                Some(vec![
+                    "resources/proj_a/a.md".to_string(),
+                    "resources/proj_a/b.md".to_string(),
+                    "resources/proj_a/c.md".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap()
+        {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Force restore's writeback of a.md to fail. The diff also rewrites
+        // b.md (success) and deletes c.md (success), so we expect a partial
+        // error with exactly one failed write and the other operations
+        // reported under the success buckets.
+        vfs.fail_write("resources/proj_a/a.md");
+
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: Some("resources/proj_a".into()),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: Some("rewind partial".into()),
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .expect_err("restore must surface partial failure");
+
+        let partial = match err {
+            GitError::RestoreWritebackPartial(p) => p,
+            other => panic!("expected RestoreWritebackPartial, got {other:?}"),
+        };
+
+        // Ref already advanced — partial must report the new HEAD so the
+        // caller knows the commit is durable even though writeback failed.
+        let head_after = ref_store.read("acct", "refs/heads/main").await.unwrap();
+        assert_eq!(partial.new_commit_oid, head_after);
+
+        assert_eq!(partial.failed_writes.len(), 1, "exactly one write failed");
+        assert_eq!(partial.failed_writes[0].0, "resources/proj_a/a.md");
+        assert!(
+            !partial.failed_writes[0].1.is_empty(),
+            "failure entry must carry a message"
+        );
+        assert!(partial.failed_deletes.is_empty(), "no deletes should fail");
+
+        // The other write (b.md) succeeded and so must show up under
+        // written_paths; c.md was deleted and lands under deleted_paths.
+        assert_eq!(partial.written_paths, vec!["resources/proj_a/b.md"]);
+        assert_eq!(partial.deleted_paths, vec!["resources/proj_a/c.md"]);
+        assert_eq!(partial.written, 1);
+        assert_eq!(partial.deleted, 1);
+    }
+
+    /// With two forced write failures we must still collect *both* — the
+    /// stream must not short-circuit after the first one. This is the
+    /// behavior change relative to the old `try_collect`.
+    #[tokio::test]
+    async fn test_restore_writeback_partial_continues_after_failure() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        vfs.put("resources/proj_a/b.md", b"B v1");
+        vfs.put("resources/proj_a/c.md", b"C v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        vfs.put("resources/proj_a/a.md", b"A v2");
+        vfs.put("resources/proj_a/b.md", b"B v2");
+        vfs.put("resources/proj_a/c.md", b"C v2");
+        let _head_oid = match svc
+            .commit(req(
+                "acct",
+                "main",
+                "head",
+                Some(vec![
+                    "resources/proj_a/a.md".to_string(),
+                    "resources/proj_a/b.md".to_string(),
+                    "resources/proj_a/c.md".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap()
+        {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Two of the three writes fail.
+        vfs.fail_write("resources/proj_a/a.md");
+        vfs.fail_write("resources/proj_a/c.md");
+
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: Some("resources/proj_a".into()),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: None,
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .expect_err("partial expected");
+
+        let partial = match err {
+            GitError::RestoreWritebackPartial(p) => p,
+            other => panic!("expected RestoreWritebackPartial, got {other:?}"),
+        };
+        assert_eq!(
+            partial.failed_writes.len(),
+            2,
+            "stream must not short-circuit on the first failure"
+        );
+        let mut failed: Vec<String> =
+            partial.failed_writes.iter().map(|(p, _)| p.clone()).collect();
+        failed.sort();
+        assert_eq!(
+            failed,
+            vec![
+                "resources/proj_a/a.md".to_string(),
+                "resources/proj_a/c.md".to_string(),
+            ]
+        );
+        // b.md still rolled back.
+        assert_eq!(partial.written_paths, vec!["resources/proj_a/b.md"]);
+    }
+
+    /// A forced delete failure (non-NotFound) must surface in
+    /// `failed_deletes` without aborting the rest of the stream.
+    #[tokio::test]
+    async fn test_restore_delete_failure_does_not_short_circuit() {
+        let (_dir, vfs, _object_store, _ref_store, svc) = make_service("acct");
+        // Source has only a.md.
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        // HEAD adds b.md and c.md — restore must delete both.
+        vfs.put("resources/proj_a/b.md", b"B new");
+        vfs.put("resources/proj_a/c.md", b"C new");
+        let _head_oid = match svc
+            .commit(req(
+                "acct",
+                "main",
+                "head",
+                Some(vec![
+                    "resources/proj_a/a.md".to_string(),
+                    "resources/proj_a/b.md".to_string(),
+                    "resources/proj_a/c.md".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap()
+        {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Force b.md's delete to fail; c.md must still be deleted.
+        vfs.fail_remove("resources/proj_a/b.md");
+
+        let err = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: Some("resources/proj_a".into()),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: None,
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .expect_err("partial expected");
+
+        let partial = match err {
+            GitError::RestoreWritebackPartial(p) => p,
+            other => panic!("expected RestoreWritebackPartial, got {other:?}"),
+        };
+        assert_eq!(partial.failed_deletes.len(), 1);
+        assert_eq!(partial.failed_deletes[0].0, "resources/proj_a/b.md");
+        assert_eq!(partial.deleted_paths, vec!["resources/proj_a/c.md"]);
+        assert!(partial.failed_writes.is_empty());
+    }
+
+    /// `Error::NotFound` from `remove` is idempotent (the path was already
+    /// gone) and must NOT count as a failure. With strict_remove enabled
+    /// and a delete target that is already missing, restore must still
+    /// return `Applied`.
+    #[tokio::test]
+    async fn test_restore_delete_notfound_not_counted_as_failure() {
+        // Use new_strict_remove so absent paths produce NotFound rather than
+        // silently succeeding — that's what the real LocalFileSystem does.
+        let dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(dir.path()));
+        let vfs = MockVfs::new_strict_remove("acct");
+        let svc = GitService::new(
+            vfs.clone() as Arc<dyn FileSystem>,
+            object_store.clone() as Arc<dyn ObjectStore>,
+            ref_store.clone() as Arc<dyn RefStore>,
+        );
+
+        vfs.put("resources/proj_a/a.md", b"A v1");
+        let source_oid = make_commit(&svc, "acct", "main", "source").await;
+
+        vfs.put("resources/proj_a/b.md", b"B new");
+        let _head_oid = match svc
+            .commit(req(
+                "acct",
+                "main",
+                "head",
+                Some(vec![
+                    "resources/proj_a/a.md".to_string(),
+                    "resources/proj_a/b.md".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap()
+        {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Out-of-band: remove b.md from the VFS so the diff's delete plan
+        // hits the NotFound path. Restore must still return Applied.
+        vfs.delete("resources/proj_a/b.md");
+
+        let resp = svc
+            .restore(RestoreRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                project_dir: Some("resources/proj_a".into()),
+                source_commit: source_oid.to_hex().to_string(),
+                dry_run: false,
+                message: None,
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .expect("idempotent delete must stay on the Applied path");
+
+        match resp {
+            RestoreResponse::Applied { deleted_paths, deleted, .. } => {
+                assert_eq!(deleted, 1, "b.md counts as deleted even though already gone");
+                assert_eq!(deleted_paths, vec!["resources/proj_a/b.md"]);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
     }
 
     #[tokio::test]

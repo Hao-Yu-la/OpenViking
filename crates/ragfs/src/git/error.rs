@@ -114,6 +114,19 @@ pub enum GitError {
         actual:   Option<gix_hash::ObjectId>,
     },
 
+    /// `restore()` advanced the branch ref to the new commit, but at least
+    /// one per-path VFS write or delete failed afterwards. The branch ref
+    /// already points at `new_commit_oid`; the caller must use the payload
+    /// to drive reindex of the paths that did reach the VFS and report the
+    /// failures to whoever needs to retry them.
+    #[error(
+        "restore writeback partial: {writes_failed} write(s) and {deletes_failed} delete(s) failed after ref advanced to {new_commit}",
+        writes_failed = .0.failed_writes.len(),
+        deletes_failed = .0.failed_deletes.len(),
+        new_commit = .0.new_commit_oid,
+    )]
+    RestoreWritebackPartial(Box<crate::git::types::RestoreWritebackPartial>),
+
     /// Blob too large
     #[error("blob too large: {size} bytes exceeds limit {limit} bytes")]
     BlobTooLarge { size: u64, limit: u64 },

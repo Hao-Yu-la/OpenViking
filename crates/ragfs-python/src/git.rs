@@ -193,9 +193,63 @@ pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
         GitError::ObjectStore(ObjectStoreError::NotFound(_)) => {
             new_py_err_pub(py, "AGFSNotFoundError", msg)
         }
+        GitError::RestoreWritebackPartial(p) => writeback_partial_to_pyerr(py, *p, msg),
         GitError::ObjectStore(_) | GitError::RefStore(_) | GitError::Vfs(_) | GitError::Other(_) => {
             PyRuntimeError::new_err(msg)
         }
+    }
+}
+
+/// Build a Python exception carrying the structured `RestoreWritebackPartial`
+/// payload. Falls back to `PyRuntimeError` when `openviking.pyagfs` is not
+/// importable (e.g. cargo-test environment) — in that case the structured
+/// data is lost, but the error message still survives.
+fn writeback_partial_to_pyerr(
+    py: Python<'_>,
+    p: RestoreWritebackPartial,
+    msg: String,
+) -> PyErr {
+    let exc_class = match PyModule::import(py, "openviking.pyagfs")
+        .and_then(|m| m.getattr("GitRestoreWritebackPartialError"))
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return PyRuntimeError::new_err(format!(
+                "{msg} (structured payload dropped: pyagfs unavailable)"
+            ));
+        }
+    };
+
+    let payload = PyDict::new(py);
+    // Strings + ints marshal trivially; (String, String) tuples become
+    // Python tuples via pyo3's IntoPy impl.
+    let set_oid = |k: &str, oid: &gix_hash::ObjectId| -> PyResult<()> {
+        payload.set_item(k, oid_hex(oid))
+    };
+
+    let build = || -> PyResult<()> {
+        set_oid("new_commit_oid", &p.new_commit_oid)?;
+        set_oid("source_commit", &p.source_commit)?;
+        set_oid("parent_commit", &p.parent_commit)?;
+        payload.set_item("written", p.written)?;
+        payload.set_item("deleted", p.deleted)?;
+        payload.set_item("unchanged", p.unchanged)?;
+        payload.set_item("written_paths", p.written_paths.clone())?;
+        payload.set_item("deleted_paths", p.deleted_paths.clone())?;
+        payload.set_item("failed_writes", p.failed_writes.clone())?;
+        payload.set_item("failed_deletes", p.failed_deletes.clone())?;
+        Ok(())
+    };
+    if let Err(e) = build() {
+        return e;
+    }
+
+    match exc_class.call1((msg.clone(), &payload)) {
+        Ok(instance) => PyErr::from_value(instance),
+        Err(_) => PyRuntimeError::new_err(format!(
+            "{msg} (structured payload dropped: failed to instantiate \
+             GitRestoreWritebackPartialError)"
+        )),
     }
 }
 
@@ -215,7 +269,7 @@ pub fn new_py_err_pub(py: Python<'_>, name: &str, msg: String) -> PyErr {
 use pyo3::types::{PyBytes, PyDict, PyList};
 use ragfs::git::{
     Actor, CommitRequest, CommitResponse, RestoreDiff, RestoreRequest, RestoreResponse,
-    ShowRequest, ShowResponse,
+    RestoreWritebackPartial, ShowRequest, ShowResponse,
 };
 
 // ---------- request parsers ----------
@@ -512,6 +566,45 @@ mod tests {
                 },
             );
             assert!(err.to_string().to_lowercase().contains("concurrent"));
+        });
+    }
+
+    /// `RestoreWritebackPartial` must round-trip through `map_git_error`
+    /// without panicking. When `openviking.pyagfs` is not importable (the
+    /// usual case in pure cargo-test environments) the helper falls back to
+    /// `PyRuntimeError` and tags the message so the operator notices the
+    /// dropped payload; we only assert on the message preamble here.
+    #[test]
+    fn map_git_error_writeback_partial() {
+        use ragfs::git::RestoreWritebackPartial;
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let payload = RestoreWritebackPartial {
+                new_commit_oid: gix_hash::ObjectId::null(gix_hash::Kind::Sha1),
+                source_commit: gix_hash::ObjectId::null(gix_hash::Kind::Sha1),
+                parent_commit: gix_hash::ObjectId::null(gix_hash::Kind::Sha1),
+                written: 1,
+                deleted: 0,
+                unchanged: 0,
+                written_paths: vec!["resources/proj_a/b.md".to_string()],
+                deleted_paths: vec![],
+                failed_writes: vec![(
+                    "resources/proj_a/a.md".to_string(),
+                    "forced write failure".to_string(),
+                )],
+                failed_deletes: vec![],
+            };
+            let err = map_git_error(
+                py,
+                GitError::RestoreWritebackPartial(Box::new(payload)),
+            );
+            let s = err.to_string().to_lowercase();
+            assert!(
+                s.contains("restore writeback partial"),
+                "expected partial message, got {s:?}"
+            );
+            // The Display includes counts derived from the payload.
+            assert!(s.contains("1 write"), "expected write count in message: {s:?}");
         });
     }
 

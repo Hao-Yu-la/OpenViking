@@ -164,3 +164,35 @@ pub enum RestoreResponse {
         source: ObjectId,
     },
 }
+
+/// Restore reached the ref-swap step (`new_commit_oid` is now branch HEAD)
+/// but at least one per-path write or delete on the VFS failed. The caller
+/// must treat this as "HEAD advanced, working tree partial":
+/// `written_paths` / `deleted_paths` list paths that *did* reach the VFS
+/// and therefore still need reindex; `failed_writes` / `failed_deletes`
+/// list the per-path failures that need follow-up.
+///
+/// Boxed inside `GitError::RestoreWritebackPartial` to keep the enum size
+/// bounded — the two path lists can be large on big restores.
+#[derive(Debug, Clone)]
+pub struct RestoreWritebackPartial {
+    pub new_commit_oid: ObjectId,
+    pub source_commit: ObjectId,
+    pub parent_commit: ObjectId,
+    /// Files that *did* reach the VFS (subset of the original plan).
+    pub written: usize,
+    /// Files that *were* deleted from the VFS (or were idempotently already gone).
+    pub deleted: usize,
+    /// Files left untouched because source/head agreed.
+    pub unchanged: usize,
+    /// Account-relative paths whose blob bytes reached the VFS.
+    pub written_paths: Vec<String>,
+    /// Account-relative paths that were removed from (or already absent from) the VFS.
+    pub deleted_paths: Vec<String>,
+    /// `(account-relative path, error message)` for writes that failed
+    /// after the ref already advanced.
+    pub failed_writes: Vec<(String, String)>,
+    /// `(account-relative path, error message)` for deletes that failed
+    /// with a non-`NotFound` error after the ref already advanced.
+    pub failed_deletes: Vec<(String, String)>,
+}

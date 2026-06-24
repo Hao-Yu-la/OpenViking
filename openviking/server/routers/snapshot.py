@@ -12,13 +12,17 @@ from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict
 
-from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
+from openviking.pyagfs.exceptions import (
+    AGFSClientError,
+    AGFSNotFoundError,
+    GitRestoreWritebackPartialError,
+)
 from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
 from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
-from openviking_cli.exceptions import InternalError, NotFoundError
+from openviking_cli.exceptions import InternalError, NotFoundError, OpenVikingError
 
 router = APIRouter(prefix="/api/v1/snapshot", tags=["snapshot"])
 
@@ -113,16 +117,27 @@ async def restore(
         )
     except AGFSNotFoundError as e:
         raise NotFoundError(request.source_commit, "git_ref") from e
+    except GitRestoreWritebackPartialError as exc:
+        # HEAD already advanced to the new commit, but some per-path VFS
+        # writes/deletes failed. Surface structured diagnostics (including
+        # task_id of the scheduled reindex) instead of collapsing to a
+        # generic InternalError.
+        raise OpenVikingError(
+            f"snapshot restore partial: {exc}",
+            code="RESTORE_WRITEBACK_PARTIAL",
+            details=exc.to_dict(),
+        ) from exc
     except AGFSClientError as e:
         mapped = map_exception(e)
         if mapped is not None:
             raise mapped from e
         raise
     except RuntimeError as e:
-        # The native git binding surfaces apply-phase failures (e.g. a VFS
-        # write/delete error) as a bare RuntimeError. Letting it reach the
-        # global mapper mislabels it as a generic "Resource not found" and
-        # discards the real path. Wrap it so the underlying message survives.
+        # Fallback for the case where the native git binding cannot import
+        # pyagfs and surfaces apply-phase failures as a bare RuntimeError.
+        # With GitRestoreWritebackPartialError wired up, structured partial
+        # failures now go through the branch above; this clause only catches
+        # the degraded path.
         raise InternalError(
             f"snapshot restore failed: {e}", cause=e
         ) from e
