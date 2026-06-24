@@ -38,7 +38,7 @@ OpenViking 在 VikingFS 之上提供了一套基于 Git 的多版本管理能力
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | message | str | 是 | - | 提交说明 |
-| paths | List[str] | 否 | null | 限定本次快照的 `viking://` URI 列表；`null` 表示对整棵账号树做快照。传入空列表 `[]` 表示显式的空路径集（不会产生改动） |
+| paths | List[str] | 否 | null | 限定本次快照的 `viking://` **文件** URI 列表；`null` 表示对整棵账号树做快照。传入空列表 `[]` 表示显式的空路径集（不会产生改动）。每个条目必须指向文件——若传入目录会抛出 `AGFSInvalidOperationError`（不会递归展开目录） |
 | branch | str | 否 | `main` | 要推进的分支 |
 | author_name | str | 否 | null | 覆盖默认的提交者名字（默认 `viking-bot`） |
 | author_email | str | 否 | null | 覆盖默认的提交者邮箱 |

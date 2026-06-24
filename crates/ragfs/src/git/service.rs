@@ -107,6 +107,13 @@ impl GitService {
     /// On no-op (no editor change) the branch ref is untouched and
     /// `CommitResponse::Noop` is returned.
     ///
+    /// When `paths` is `Some(...)`, every listed path must refer to a file in
+    /// the VFS. A path that resolves to a directory returns
+    /// `GitError::PathIsDirectoryInCommit` — the commit API does not currently
+    /// expand a directory into its contents, and silently skipping the entry
+    /// would surprise a caller expecting a recursive snapshot. To commit a
+    /// subtree, list each file explicitly or omit `paths` for full enumeration.
+    ///
     /// On a CAS conflict, returns `GitError::ConcurrentCommit` so the
     /// caller can decide whether to retry. There is intentionally no
     /// retry loop inside `commit()`.
@@ -128,6 +135,12 @@ impl GitService {
         } = req;
         validate_account_id(&account)?;
         let ref_name = format!("refs/heads/{branch}");
+        // Whether the caller explicitly passed `paths`. A directory listed in
+        // an explicit list is a user-facing error (see the loop below), but
+        // full enumeration must stay defensive against a stray directory entry
+        // — collect_all/prev_tree should never emit one, yet a `continue`
+        // there costs nothing.
+        let paths_was_explicit = paths.is_some();
 
         // 1. Resolve current HEAD (may not exist → root commit).
         let prev_head: Option<ObjectId> = match self.ref_store.read(&account, &ref_name).await {
@@ -261,7 +274,18 @@ impl GitService {
         for rel_path in candidates {
             let abs = format!("/local/{}/{}", account, rel_path);
             match self.vfs.stat(&abs).await {
-                Ok(info) if info.is_dir => continue, // ignore directories
+                Ok(info) if info.is_dir => {
+                    if paths_was_explicit {
+                        // The caller asked for this exact path. We do not
+                        // expand directories — surface a clear error rather
+                        // than committing nothing under it.
+                        return Err(GitError::PathIsDirectoryInCommit(rel_path));
+                    }
+                    // Full enumeration: defensive skip. `collect_all` does not
+                    // emit directories, and the prev_tree union only contains
+                    // blob paths in a well-formed tree.
+                    continue;
+                }
                 Ok(info) => {
                     let stat = stat_signature(&info);
 
@@ -4345,6 +4369,92 @@ mod fast_path1_tests {
             reads_after_first + 1,
             "without an IndexStore the slow path runs every commit",
         );
+    }
+
+    // ── commit: directory in explicit `paths` ──────────────────────────
+    /// Passing a directory in `CommitRequest.paths` must produce a clear
+    /// error (`GitError::PathIsDirectoryInCommit`) rather than silently
+    /// skipping the entry. Regression test for the misleading CLI example
+    /// `ov snapshot commit -m "docs only" --paths viking://docs` that used
+    /// to noop instead of recursing.
+    ///
+    /// Backed by `LocalFileSystem` because the in-memory `MockVfs` does not
+    /// model directories: `MockVfs::stat` only returns Ok for paths it has
+    /// stored as a file. We need a real VFS where `stat("resources/proj")`
+    /// returns a `FileInfo` with `is_dir = true`.
+    #[tokio::test]
+    async fn test_commit_rejects_directory_in_explicit_paths() {
+        use crate::plugins::localfs::LocalFileSystem;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(store_dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(store_dir.path()));
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let acct_root = work_dir.path().join("local").join("acct");
+        std::fs::create_dir_all(acct_root.join("resources/proj")).unwrap();
+        std::fs::write(acct_root.join("resources/proj/a.md"), b"hello").unwrap();
+        let vfs: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(work_dir.path().to_str().unwrap()).unwrap());
+
+        let svc = GitService::new(vfs, object_store, ref_store);
+
+        let err = svc
+            .commit(CommitRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                message: "dir please".into(),
+                paths: Some(vec!["resources/proj".to_string()]),
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .unwrap_err();
+
+        match err {
+            GitError::PathIsDirectoryInCommit(p) => assert_eq!(p, "resources/proj"),
+            other => panic!("expected PathIsDirectoryInCommit, got {other:?}"),
+        }
+    }
+
+    /// Full enumeration (`paths = None`) must still tolerate a directory
+    /// stat showing up — the loop's defensive `continue` survives the change.
+    /// `LocalFileSystem` plus an in-tree directory exercises the path
+    /// (collect_all itself filters dirs, but the prev_tree union code reads
+    /// stat for every entry, and we want to pin the non-error behaviour).
+    #[tokio::test]
+    async fn test_commit_full_enumeration_tolerates_directories() {
+        use crate::plugins::localfs::LocalFileSystem;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let object_store = Arc::new(LocalObjectStore::new(store_dir.path()));
+        let ref_store = Arc::new(LocalRefStore::new(store_dir.path()));
+
+        let work_dir = tempfile::tempdir().unwrap();
+        let acct_root = work_dir.path().join("local").join("acct");
+        std::fs::create_dir_all(acct_root.join("resources/proj")).unwrap();
+        std::fs::write(acct_root.join("resources/proj/a.md"), b"hello").unwrap();
+        let vfs: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(work_dir.path().to_str().unwrap()).unwrap());
+
+        let svc = GitService::new(vfs, object_store, ref_store);
+
+        // paths = None must succeed (and commit the single file under proj/).
+        let resp = svc
+            .commit(CommitRequest {
+                account: "acct".into(),
+                branch: "main".into(),
+                message: "full".into(),
+                paths: None,
+                author_name: "tester".into(),
+                author_email: "tester@example.com".into(),
+            })
+            .await
+            .unwrap();
+        match resp {
+            CommitResponse::Created { changed, .. } => assert_eq!(changed, 1),
+            other => panic!("expected Created, got {other:?}"),
+        }
     }
 }
 

@@ -173,6 +173,9 @@ pub fn map_git_error(py: Python<'_>, e: ragfs::git::GitError) -> PyErr {
         GitError::ConcurrentCommit { .. } => new_py_err_pub(py, "GitConcurrentCommitError", msg),
         GitError::PathNotFound(_) => new_py_err_pub(py, "AGFSNotFoundError", msg),
         GitError::PathIsDirectory(_) => new_py_err_pub(py, "AGFSInvalidOperationError", msg),
+        GitError::PathIsDirectoryInCommit(_) => {
+            new_py_err_pub(py, "AGFSInvalidOperationError", msg)
+        }
         GitError::SubtreeNotFoundInCommit { .. } => new_py_err_pub(py, "AGFSNotFoundError", msg),
         GitError::InvalidAccountId(_) => new_py_err_pub(py, "AGFSInvalidPathError", msg),
         GitError::InvalidProjectDir(_) => new_py_err_pub(py, "AGFSInvalidPathError", msg),
@@ -518,6 +521,20 @@ mod tests {
         Python::attach(|py| {
             let err = map_git_error(py, GitError::PathNotFound("foo/bar".into()));
             assert!(err.to_string().contains("foo/bar"));
+        });
+    }
+
+    #[test]
+    fn map_git_error_path_is_directory_in_commit() {
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let err = map_git_error(
+                py,
+                GitError::PathIsDirectoryInCommit("resources/proj".into()),
+            );
+            let s = err.to_string();
+            assert!(s.contains("resources/proj"), "missing path in {s}");
+            assert!(s.contains("directory"), "missing 'directory' in {s}");
         });
     }
 

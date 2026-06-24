@@ -3429,9 +3429,12 @@ class VikingFS:
 
         Args:
             message: Commit message.
-            paths: Optional list of ``viking://`` URIs to scope the commit to.
-                ``None`` (default) enumerates the whole account tree. An empty
-                list is forwarded as an explicit empty path list (no-op commit).
+            paths: Optional list of ``viking://`` file URIs to scope the commit
+                to. ``None`` (default) enumerates the whole account tree. An
+                empty list is forwarded as an explicit empty path list (no-op
+                commit). Each entry must point to a file — passing a directory
+                raises ``AGFSInvalidOperationError``; directories are not
+                expanded into their contents.
             branch: Branch to advance. Defaults to ``"main"``.
             author_name / author_email: Override the default bot author.
             ctx: Request context (provides ``account_id``).

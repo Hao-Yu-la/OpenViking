@@ -1029,7 +1029,7 @@ pub(crate) enum SnapshotCmd {
     Commit {
         #[arg(short = 'm', long)]
         message: String,
-        /// Limit to specific viking:// URIs (comma-separated); omit for full snapshot
+        /// Limit to specific viking:// file URIs (comma-separated). Directories are NOT expanded; pass each file explicitly. Omit to snapshot the full account tree.
         #[arg(long, value_delimiter = ',')]
         paths: Option<Vec<String>>,
         #[arg(long, default_value = "main")]
