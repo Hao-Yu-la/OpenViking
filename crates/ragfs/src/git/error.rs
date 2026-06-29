@@ -134,6 +134,18 @@ pub enum GitError {
     #[error("too many files: {count} exceeds limit {limit}")]
     TooManyFiles { count: usize, limit: usize },
 
+    /// `.ovgitignore` exceeds the configured size limit.
+    #[error("ignore file too large: {path} is {size} bytes, limit {max} bytes")]
+    IgnoreFileTooLarge {
+        path: String,
+        size: u64,
+        max: u64,
+    },
+
+    /// `.ovgitignore` is syntactically invalid or cannot be decoded.
+    #[error("invalid ignore file {path}: {reason}")]
+    InvalidIgnoreFile { path: String, reason: String },
+
     /// Feature not enabled
     #[error("git feature not enabled")]
     FeatureDisabled,
