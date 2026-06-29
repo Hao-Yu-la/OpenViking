@@ -863,6 +863,19 @@ class VikingFS:
             author_email=author_email or self._default_author_email(),
         )
 
+    async def get_gitignore(self, ctx: RequestContext | None = None) -> str:
+        """读取账号级 .ovgitignore;不存在时返回空字符串。"""
+
+    async def set_gitignore(
+        self,
+        content: str,
+        ctx: RequestContext | None = None,
+    ) -> None:
+        """写入账号级 .ovgitignore,不触发语义索引。"""
+
+    async def delete_gitignore(self, ctx: RequestContext | None = None) -> None:
+        """删除账号级 .ovgitignore;不存在视为成功。"""
+
     async def restore(
         self,
         *,

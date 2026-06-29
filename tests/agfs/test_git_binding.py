@@ -390,8 +390,7 @@ def test_restore_does_not_apply_current_ovgitignore(client):
         author_name="tester",
         author_email="tester@example.com",
     )
-    # The "ignored" field might not be available in the current build
-    # assert v2["ignored"] >= 1
+    assert v2["ignored"] >= 1
 
     restored = client.git_restore(
         account=account,
