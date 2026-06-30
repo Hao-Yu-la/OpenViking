@@ -139,17 +139,29 @@ impl GitService {
         }
         let ref_name = format!("refs/heads/{branch}");
 
-        // Load ignore matcher and initialize counters
+        // Load ignore matcher and initialize counters.
+        //
+        // `credited_ignored` / `credited_removed` deduplicate counting across
+        // the per-path iterations of a scoped commit: a path listed twice, or
+        // listed both as a directory and as a file under it, is processed by
+        // multiple iterations but must be credited at most once to `ignored`
+        // (on-disk skip) and once to `changed` (snapshot removal). The tree
+        // itself is already correct — `editor.remove` is idempotent and the
+        // BTreeSet dedups candidates — only the reported counts need guarding.
         let ignore_matcher = load_ignore_matcher(&self.vfs, &account).await?;
         let mut ignored = 0usize;
         let mut changed = 0usize;
+        let mut credited_ignored: HashSet<String> = HashSet::new();
+        let mut credited_removed: HashSet<String> = HashSet::new();
 
         let mut include_path = |path: &str| -> bool {
             if crate::git::enumerate::prune_path(path) {
                 return false;
             }
             if !should_track_path(path, &ignore_matcher) {
-                ignored += 1;
+                if credited_ignored.insert(path.to_string()) {
+                    ignored += 1;
+                }
                 return false;
             }
             true
@@ -283,7 +295,9 @@ impl GitService {
                                         editor
                                             .remove(self.object_store.as_ref(), &account, path)
                                             .await?;
-                                        changed += 1;
+                                        if credited_removed.insert(path.clone()) {
+                                            changed += 1;
+                                        }
                                     }
                                 }
                             }
@@ -300,15 +314,30 @@ impl GitService {
                                 // in prev_tree — TreeEditor::remove silently
                                 // no-ops for missing paths (mirrors the main
                                 // loop's NotFound branch below).
-                                let was_tracked = crate::git::tree_builder::lookup(
-                                    self.object_store.as_ref(),
-                                    &account,
-                                    t,
-                                    p,
-                                )
-                                .await?
-                                .is_some();
-                                if was_tracked {
+                                //
+                                // Reuse the already-flattened prev_paths_cache
+                                // (loading it once on first need) instead of a
+                                // per-file root-to-leaf `lookup` tree walk, so
+                                // a scoped commit listing many now-ignored
+                                // explicit files pays one flatten + O(1) probes
+                                // rather than K independent walks.
+                                if prev_paths_cache.is_none() {
+                                    prev_paths_cache = Some(
+                                        crate::git::tree_builder::flatten(
+                                            self.object_store.as_ref(),
+                                            &account,
+                                            t,
+                                            &None,
+                                        )
+                                        .await?,
+                                    );
+                                }
+                                let was_tracked = prev_paths_cache
+                                    .as_ref()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|(pp, _)| pp == p);
+                                if was_tracked && credited_removed.insert(p.clone()) {
                                     editor
                                         .remove(self.object_store.as_ref(), &account, p)
                                         .await?;
@@ -333,6 +362,37 @@ impl GitService {
 
                             if include_path(p) {
                                 set.insert(p.clone());
+                            } else if let Some(t) = prev_tree {
+                                // `p` is gone from disk AND now ignored/pruned, so
+                                // it never enters the candidate set (the main
+                                // loop's NotFound branch won't see it). Mirror the
+                                // File branch: drop it from the snapshot directly
+                                // if it was previously tracked, so the user's
+                                // deletion is not silently lost as a Noop. Reuse
+                                // prev_paths_cache (loaded once on first need)
+                                // rather than a per-path `lookup` walk.
+                                if prev_paths_cache.is_none() {
+                                    prev_paths_cache = Some(
+                                        crate::git::tree_builder::flatten(
+                                            self.object_store.as_ref(),
+                                            &account,
+                                            t,
+                                            &None,
+                                        )
+                                        .await?,
+                                    );
+                                }
+                                let was_tracked = prev_paths_cache
+                                    .as_ref()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|(pp, _)| pp == p);
+                                if was_tracked && credited_removed.insert(p.clone()) {
+                                    editor
+                                        .remove(self.object_store.as_ref(), &account, p)
+                                        .await?;
+                                    changed += 1;
+                                }
                             }
                             if let Some(t) = prev_tree {
                                 if prev_paths_cache.is_none() {
@@ -366,7 +426,9 @@ impl GitService {
                                         editor
                                             .remove(self.object_store.as_ref(), &account, path)
                                             .await?;
-                                        changed += 1;
+                                        if credited_removed.insert(path.clone()) {
+                                            changed += 1;
+                                        }
                                     }
                                 }
                             }
@@ -413,7 +475,9 @@ impl GitService {
                             editor
                                 .remove(self.object_store.as_ref(), &account, &p)
                                 .await?;
-                            changed += 1;
+                            if credited_removed.insert(p.clone()) {
+                                changed += 1;
+                            }
                         }
                     }
                 }
@@ -2657,6 +2721,129 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, GitError::InvalidIgnoreFile { .. }));
+    }
+
+    /// A scoped commit listing an explicit file that is BOTH deleted from disk
+    /// AND newly matched by `.ovgitignore` must still drop it from the
+    /// snapshot. Regression: the NotFound branch routed `p` through
+    /// `include_path`, which returns false for ignored paths, so `p` never
+    /// entered the candidate set and the prev_tree prefix loop (`p/`) does not
+    /// match the file path itself — the stale blob lingered and `changed`
+    /// stayed 0 (Noop), silently losing the user's deletion. The File (Ok)
+    /// branch handles the on-disk analogue; this asserts symmetry.
+    #[tokio::test]
+    async fn test_commit_scoped_notfound_ignored_file_is_removed_from_snapshot() {
+        let (_dir, vfs, object_store, _ref_store, svc) =
+            make_service("acct_nf_ignore");
+        vfs.put("resources/secret.log", b"tracked before ignore");
+        let first = make_commit(&svc, "acct_nf_ignore", "main", "first").await;
+        let first_tree = commit_tree(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct_nf_ignore",
+            first,
+        )
+        .await;
+        assert!(lookup(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct_nf_ignore",
+            first_tree,
+            "resources/secret.log",
+        )
+        .await
+        .unwrap()
+        .is_some());
+
+        // Ignore logs, delete the file from disk, then commit it by name.
+        vfs.put(OVGITIGNORE_PATH, b"*.log\n");
+        vfs.delete("resources/secret.log");
+        let resp = svc
+            .commit(req(
+                "acct_nf_ignore",
+                "main",
+                "second",
+                Some(vec!["resources/secret.log".to_string()]),
+            ))
+            .await
+            .unwrap();
+        let second_oid = match resp {
+            CommitResponse::Created { commit_oid, .. } => commit_oid,
+            other => panic!("expected Created (deletion), got {other:?}"),
+        };
+        let second_tree = commit_tree(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct_nf_ignore",
+            second_oid,
+        )
+        .await;
+        assert!(
+            lookup(
+                object_store.as_ref() as &dyn ObjectStore,
+                "acct_nf_ignore",
+                second_tree,
+                "resources/secret.log",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "deleted-and-ignored explicit file must not linger in the snapshot"
+        );
+    }
+
+    /// Duplicate or overlapping entries in `paths` must not inflate the
+    /// `ignored`/`changed` counters. Regression: the scoped branches counted
+    /// per listed entry (before BTreeSet dedup) and `was_tracked` probed the
+    /// immutable prev_tree, so listing an ignored file twice reported
+    /// `ignored=2, changed=2` for a single file. The tree itself was correct
+    /// (editor.remove is idempotent); only the reported counts were wrong.
+    #[tokio::test]
+    async fn test_commit_scoped_duplicate_paths_do_not_double_count() {
+        let (_dir, vfs, object_store, _ref_store, svc) = make_service("acct_dup");
+        // First commit tracks resources/a.log (no ignore rule yet).
+        vfs.put("resources/a.log", b"tracked before ignore");
+        let _first = make_commit(&svc, "acct_dup", "main", "first").await;
+
+        // Now ignore logs and commit a.log by name TWICE. It is both on disk
+        // and in prev_tree, so each distinct path must contribute exactly one
+        // `ignored` and one removal `changed`.
+        vfs.put(OVGITIGNORE_PATH, b"*.log\n");
+        let resp = svc
+            .commit(req(
+                "acct_dup",
+                "main",
+                "dup",
+                Some(vec![
+                    "resources/a.log".to_string(),
+                    "resources/a.log".to_string(),
+                ]),
+            ))
+            .await
+            .unwrap();
+        let (second_oid, ignored, changed) = match resp {
+            CommitResponse::Created {
+                commit_oid,
+                ignored,
+                changed,
+            } => (commit_oid, ignored, changed),
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert_eq!(ignored, 1, "duplicate ignored path counted once");
+        assert_eq!(changed, 1, "duplicate removal counted once");
+
+        let second_tree = commit_tree(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct_dup",
+            second_oid,
+        )
+        .await;
+        assert!(lookup(
+            object_store.as_ref() as &dyn ObjectStore,
+            "acct_dup",
+            second_tree,
+            "resources/a.log",
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     /// A scoped commit listing a *directory* must drop previously-tracked
