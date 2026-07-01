@@ -220,7 +220,7 @@ The `.ovgitignore` file at the account root is an account-level exclusion file, 
 
 Key points:
 
-- The rules file itself is **always versioned** — even if a rule matches `.ovgitignore` it is still included in snapshots, so rule changes are auditable and restorable.
+- The rules file itself is **never ignored by `.ovgitignore` rules** — even if a rule matches `.ovgitignore` it is still included in snapshots, so rule changes are auditable and restorable.
 - Rules affect **only `commit`**; `restore`, `show`, and `log` treat commit contents as authoritative and do not apply the current `.ovgitignore` as a filter. So restoring a historical snapshot still restores files that match the current rules.
 - If a file was tracked in an earlier commit and a later rule matches it, the next `commit` removes it from the new snapshot (the workspace file itself is untouched).
 - `.ovgitignore` never enters vector indexing/retrieval.
